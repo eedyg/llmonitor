@@ -1,0 +1,55 @@
+# ---------------------------------------------------------------------------
+# Runtime state / databases (monitor's own sqlite db + WAL/SHM)
+# ---------------------------------------------------------------------------
+state/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Logs & request captures (JSONL request logs live outside this repo by default)
+*.log
+logs/
+*.jsonl
+
+# ---------------------------------------------------------------------------
+# Python build artifacts
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# Local secrets / local overrides
+# ---------------------------------------------------------------------------
+.env
+.env.*
+*.local.yaml
+
+# ---------------------------------------------------------------------------
+# Screenshots / benchmark output produced by tools/
+# ---------------------------------------------------------------------------
+screenshots/
+
+# ---------------------------------------------------------------------------
+# Editor / OS noise
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# NOTE: monitor/web/vendor/ (uPlot) is intentionally committed — the frontend
+# has no npm build step and must work offline. Do not ignore it.

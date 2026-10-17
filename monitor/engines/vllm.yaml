@@ -1,0 +1,225 @@
+# Declarative description of the vLLM engine.
+#
+# Every value below is knowledge extracted from ../run_llm.sh. The parity tool
+# (tools/parity.py) diffs the resolved argv against `run_llm.sh --dry-run`
+# across the profile/ctx matrix, so this file must stay byte-exact until
+# run_llm.sh is retired.
+#
+# Templating: ${var} is substituted strictly (unknown var = error).
+
+name: vllm
+kind: container
+
+container_name: vllm-qwen38
+image: "vllm/vllm-openai:cu130-sm120"
+default_ctx: "128k"
+model_max_context: 262144
+served_model_name: "qwen3.8-27b"
+
+models:
+  # Same resolution order as run_llm.sh: first candidate containing <dir>/config.json
+  dir_candidates:
+    - "${project_dir}/models"
+    - "/home/eedy/workspace/git/vllm/models"
+  dir_name: "Qwen3.8-27B-FP8"
+  dflash_dir_name: "Qwen3.8-27B-DFlash2"
+
+defaults:
+  # 48 of 64 layers are linear attention: each decode sequence pins one Mamba
+  # cache block. At gpu_mem_util 0.92 only ~250 blocks exist, so vLLM's default
+  # max_num_seqs=256 makes CUDA-graph capture fail. Keep this below the blocks.
+  max_num_seqs: "192"
+  gpu_mem_util: "0.92"
+  # fp8 halves the KV footprint; 256k fits (366,097 KV tokens = 1.40x).
+  kv_cache_dtype: "fp8"
+  mamba_ssm_cache_dtype: ""
+  reasoning_parser: "qwen3"
+  tool_call_parser: "qwen3_coder"
+  log_level: "INFO"
+  hf_hub_offline: "1"
+  restart_policy: "no"
+  privileged: "0"
+  cors: "1"
+  spec_metrics: "summary"
+  kv_offload_gb: "4"
+  cpu_bytes_to_use: "6442450944"
+  spec_tokens:
+    stage1: null
+    mtp: "3"
+    dflash: "7"
+  cache_dir: "${project_dir}/vllm_cache_nvidia"
+  kvoffload_dir: "${home}/kvoffload"
+
+container:
+  flags:
+    - run
+    - "-d"
+    - "--name"
+    - "${container_name}"
+    - "-t"
+    - "--restart"
+    - "${restart_policy}"
+    - "--network"
+    - "host"
+    - "--ipc=host"
+    - "--security-opt"
+    - "seccomp=unconfined"
+    - "--ulimit"
+    - "memlock=-1"
+    - "--ulimit"
+    - "stack=67108864"
+  device: "nvidia.com/gpu=all"
+  privileged_flag: "--privileged"
+  labels:
+    # lets the monitor recognise containers it created, even after a rename
+    llm-monitor.managed: "1"
+    llm-monitor.engine: "vllm"
+  mounts:
+    - "${models_dir}:/models:ro"
+    - "${cache_dir}:/root/.cache/vllm"
+  env:
+    VLLM_CACHE_ROOT: "/root/.cache/vllm"
+    VLLM_LOGGING_LEVEL: "${log_level}"
+    HF_HUB_OFFLINE: "${hf_hub_offline}"
+    TRANSFORMERS_OFFLINE: "${hf_hub_offline}"
+
+engine_args:
+  - "--model"
+  - "/models/${model_dir_name}"
+  - "--served-model-name"
+  - "${served_model_name}"
+  - "--host"
+  - "${host}"
+  - "--port"
+  - "${port}"
+  - "--max-model-len"
+  - "${ctx}"
+  - "--gpu-memory-utilization"
+  - "${gpu_mem_util}"
+  - "--max-num-seqs"
+  - "${max_num_seqs}"
+  - "--enable-prefix-caching"
+
+conditional_args:
+  - when: {reasoning_parser: {truthy: true}}
+    args: ["--reasoning-parser", "${reasoning_parser}"]
+  - when: {tool_call_parser: {truthy: true}}
+    args: ["--enable-auto-tool-choice", "--tool-call-parser", "${tool_call_parser}"]
+  - when: {api_key: {truthy: true}}
+    args: ["--api-key", "${api_key}"]
+  - when: {cors: {falsy: true}}
+    args: ["--allowed-origins", "[]"]
+  - when: {kv_cache_dtype: {ne: "auto"}}
+    args: ["--kv-cache-dtype", "${kv_cache_dtype}"]
+  - when: {mamba_ssm_cache_dtype: {truthy: true}}
+    args: ["--mamba-ssm-cache-dtype", "${mamba_ssm_cache_dtype}"]
+
+profiles:
+  stage1: {}
+  mtp:
+    args:
+      - "--speculative-config"
+      - '{"method":"qwen3_5_mtp","num_speculative_tokens":${spec_tokens}}'
+      - "--per-request-spec-decode-metrics"
+      - "${spec_metrics}"
+  dflash:
+    args:
+      - "--speculative-config"
+      - '{"method":"dflash","model":"/models/${dflash_dir_name}","num_speculative_tokens":${spec_tokens}}'
+      - "--per-request-spec-decode-metrics"
+      - "${spec_metrics}"
+    requires:
+      - "${models_dir}/${dflash_dir_name}/config.json"
+  kv2:
+    args:
+      - "--kv-offloading-size"
+      - "${kv_offload_gb}"
+      - "--kv-offloading-backend"
+      - "native"
+  kv3:
+    args:
+      - "--kv-transfer-config"
+      - |-
+        {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{
+          "spec_name":"TieringOffloadingSpec",
+          "cpu_bytes_to_use":${cpu_bytes_to_use},
+          "eviction_policy":"arc",
+          "secondary_tiers":[{"type":"fs","root_dir":"/kvoffload/${model_dir_name}",
+            "n_read_threads":16,"n_write_threads":8,"locality":"LOCAL",
+            "backpressure":{"backpressure_cls":"DropStorePolicy"}}]}}
+    mounts:
+      - "${kvoffload_dir}:/kvoffload"
+
+# Fields rendered by the web UI for THIS engine. `key` is the launcher variable
+# name, so adding a field never needs UI code.
+options:
+  - key: kv_cache_dtype
+    label: "KV 类型"
+    type: enum
+    choices: [fp8, auto, fp8_e4m3, fp8_e5m2]
+    choice_labels:
+      fp8: "fp8（默认）"
+      auto: "auto = bf16"
+      fp8_e4m3: "fp8_e4m3"
+      fp8_e5m2: "fp8_e5m2"
+    default: fp8
+    hint: "fp8 让 256k 放得下；auto(bf16) 在 256k 会 OOM"
+  - key: max_num_seqs
+    label: "max num seqs"
+    type: int
+    default: 192
+    hint: "受 Mamba cache block 数限制（约 250）"
+  - key: gpu_mem_util
+    label: "GPU 显存占比"
+    type: float
+    default: 0.92
+    step: 0.01
+  - key: spec_tokens
+    label: "投机 token 数"
+    type: int
+    default: null
+    placeholder: "profile 默认（mtp 3 / dflash 7）"
+    show_if: {profiles: [mtp, dflash]}
+  - key: reasoning_parser
+    label: "reasoning parser"
+    type: enum
+    choices: [qwen3, ""]
+    choice_labels: {qwen3: "qwen3（拆分 thinking）", "": "关闭"}
+    default: qwen3
+  - key: tool_call_parser
+    label: "tool-call parser"
+    type: enum
+    choices: [qwen3_coder, ""]
+    choice_labels: {qwen3_coder: "qwen3_coder", "": "关闭"}
+    default: qwen3_coder
+  - key: mamba_ssm_cache_dtype
+    label: "Mamba 状态精度"
+    type: enum
+    choices: ["", bfloat16, float32]
+    choice_labels: {"": "默认 (float32)", bfloat16: "bfloat16（省一半）", float32: "float32"}
+    default: ""
+    hint: "bfloat16 可把 Mamba block 数翻倍"
+  - key: cors
+    label: "CORS"
+    type: bool
+    default: "1"
+  - key: api_key
+    label: "API Key"
+    type: password
+    default: ""
+    hint: "引擎鉴权 + 网关注入；长期使用请写进 config.yaml → engine.extra_env.API_KEY"
+
+# Log lines used to turn "starting…" into a real progress display.
+# index in this list == progress; `error: true` marks a failure marker.
+startup:
+  - {match: "Initializing a V1 LLM engine", phase: "初始化引擎"}
+  - {match: "Loading model from scratch|Loading weights took|Model loading took", phase: "加载权重"}
+  - {match: "profiling/warmup run|kernel warmup starting|Warming up", phase: "预热"}
+  - {match: "Graph capturing finished|Capturing CUDA graph", phase: "捕获 CUDA Graph"}
+  - {match: "init engine .* took|Starting vLLM API server|Waiting for application startup", phase: "启动 API"}
+  - {match: "Application startup complete|Uvicorn running", phase: "就绪"}
+  - {match: "CUDA out of memory|RuntimeError|ValueError|Traceback", phase: "错误", error: true}
+
+# Profiles this engine refuses (with the reason shown to the user).
+unsupported_profiles:
+  dflash2: "Profile 'dflash2' is NInfer-only; vLLM uses --profile dflash here."

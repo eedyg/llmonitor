@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LLM Monitor</title>
+<link rel="stylesheet" href="/static/vendor/uPlot.min.css" />
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div class="bg-orbs" aria-hidden="true"><i></i><i></i><i></i></div>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="logo"><span>◈</span></div>
+    <div class="brand-text">
+      <h1>LLM Monitor</h1>
+      <p>vLLM · NInfer — 统一控制与观测</p>
+    </div>
+  </div>
+
+  <div class="status-cluster">
+    <div class="state-pill" id="state-pill" data-state="unknown">
+      <span class="led"></span><span id="state-label">未知</span>
+    </div>
+    <div class="chip mono" id="chip-engine">—</div>
+    <div class="chip mono" id="chip-ports">—</div>
+    <div class="chip mono" id="chip-uptime">—</div>
+    <button class="icon-btn" id="theme-toggle" title="切换主题">◐</button>
+  </div>
+</header>
+
+<main>
+  <nav class="tabbar" id="tabbar">
+    <button class="tab active" data-tab="overview">总览</button>
+    <button class="tab" data-tab="requests">
+      请求<span class="tab-badge" id="tab-live-count" hidden>0</span>
+    </button>
+    <button class="tab" data-tab="engine">
+      引擎<span class="tab-dot" id="tab-engine-dot"></span>
+    </button>
+    <button class="tab" data-tab="docker">Docker</button>
+  </nav>
+
+  <!-- ══ 总览 ═══════════════════════════════════════════════════════════ -->
+  <section class="tab-panel" data-panel="overview">
+    <section class="kpis" id="kpis">
+      <div class="card kpi">
+        <div class="kpi-top"><span>Decode 速度</span><canvas class="spark" data-key="decode_tps"></canvas></div>
+        <div class="kpi-value"><b id="k-decode">—</b><small>tok/s</small></div>
+        <div class="kpi-sub" id="k-decode-sub">—</div>
+      </div>
+      <div class="card kpi">
+        <div class="kpi-top"><span>Prefill 速度</span><canvas class="spark" data-key="prefill_tps"></canvas></div>
+        <div class="kpi-value"><b id="k-prefill">—</b><small>tok/s</small></div>
+        <div class="kpi-sub" id="k-prefill-sub">—</div>
+      </div>
+      <div class="card kpi">
+        <div class="kpi-top"><span>TTFT p50</span><canvas class="spark" data-key="ttft_p50_ms"></canvas></div>
+        <div class="kpi-value"><b id="k-ttft">—</b><small>ms</small></div>
+        <div class="kpi-sub" id="k-ttft-sub">—</div>
+      </div>
+      <div class="card kpi">
+        <div class="kpi-top"><span>KV 占用</span><canvas class="spark" data-key="kv_pct"></canvas></div>
+        <div class="kpi-value"><b id="k-kv">—</b><small>%</small></div>
+        <div class="kpi-sub" id="k-kv-sub">—</div>
+      </div>
+      <div class="card kpi">
+        <div class="kpi-top"><span>在飞请求</span><canvas class="spark" data-key="running"></canvas></div>
+        <div class="kpi-value"><b id="k-req">—</b><small>running</small></div>
+        <div class="kpi-sub" id="k-req-sub">—</div>
+      </div>
+      <div class="card kpi">
+        <div class="kpi-top"><span>GPU 利用率</span><canvas class="spark" data-key="gpu_util"></canvas></div>
+        <div class="kpi-value"><b id="k-gpu">—</b><small>%</small></div>
+        <div class="kpi-sub" id="k-gpu-sub">—</div>
+      </div>
+      <div class="card kpi">
+        <div class="kpi-top"><span>显存</span><canvas class="spark" data-key="vram_pct"></canvas></div>
+        <div class="kpi-value"><b id="k-vram">—</b><small>MiB</small></div>
+        <div class="kpi-sub" id="k-vram-sub">—</div>
+      </div>
+      <div class="card kpi">
+        <div class="kpi-top"><span>功耗 / 温度</span><canvas class="spark" data-key="power_w"></canvas></div>
+        <div class="kpi-value"><b id="k-power">—</b><small>W</small></div>
+        <div class="kpi-sub" id="k-power-sub">—</div>
+      </div>
+    </section>
+
+    <section class="charts">
+      <div class="card chart-card">
+        <div class="card-head"><h2>吞吐</h2><span class="hint">tok/s · 最近 1h</span></div>
+        <div class="chart" id="chart-speed"></div>
+      </div>
+      <div class="card chart-card">
+        <div class="card-head"><h2>延迟</h2><span class="hint">TTFT / ITL · ms</span></div>
+        <div class="chart" id="chart-latency"></div>
+      </div>
+      <div class="card chart-card">
+        <div class="card-head"><h2>缓存与显存</h2><span class="hint">%</span></div>
+        <div class="chart" id="chart-cache"></div>
+      </div>
+      <div class="card chart-card">
+        <div class="card-head"><h2>功耗与温度</h2><span class="hint">W / °C</span></div>
+        <div class="chart" id="chart-power"></div>
+      </div>
+    </section>
+
+    <section class="card gpu-card">
+      <div class="card-head"><h2>GPU</h2><span class="hint" id="info-gpu-mode">—</span></div>
+      <dl class="kv gpu-kv" id="gpu-info"></dl>
+      <div class="procs" id="gpu-procs"></div>
+    </section>
+  </section>
+
+  <!-- ══ 请求 ═══════════════════════════════════════════════════════════ -->
+  <section class="tab-panel" data-panel="requests" hidden>
+    <section class="summary-bar" id="summary-bar">
+      <div class="sum-item"><span>请求总数</span><b id="sum-total">—</b></div>
+      <div class="sum-item"><span>错误</span><b id="sum-errors">—</b></div>
+      <div class="sum-item"><span>近 1h 平均 decode</span><b id="sum-decode">—</b></div>
+      <div class="sum-item"><span>近 1h 平均 TTFT</span><b id="sum-ttft">—</b></div>
+      <div class="sum-item"><span>近 1h 平均 prompt</span><b id="sum-prompt">—</b></div>
+      <div class="sum-item"><span>近 1h 平均输出</span><b id="sum-out">—</b></div>
+    </section>
+
+    <section class="card live-card">
+      <div class="card-head">
+        <h2>实时请求</h2>
+        <span class="hint" id="live-hint">0 个在飞</span>
+      </div>
+      <div class="live-list" id="live-list">
+        <div class="empty">当前没有在飞请求</div>
+      </div>
+    </section>
+
+    <section class="card history-card">
+      <div class="card-head">
+        <h2>请求历史</h2>
+        <div class="filters">
+          <input id="filter-search" class="mono" placeholder="搜索 id / model" />
+          <select id="filter-engine">
+            <option value="">全部引擎</option>
+            <option value="vllm">vLLM</option>
+            <option value="ninfer">NInfer</option>
+          </select>
+          <select id="filter-status">
+            <option value="">全部状态</option>
+            <option value="ok">成功</option>
+            <option value="error">失败</option>
+          </select>
+          <button class="btn small" id="btn-refresh">刷新</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="history">
+          <thead>
+            <tr>
+              <th>时间</th><th>引擎</th><th>协议</th><th class="num">Prompt</th>
+              <th class="num">缓存</th><th class="num">思考</th><th class="num">输出</th>
+              <th class="num">TTFT</th><th class="num">Decode</th><th class="num">耗时</th>
+              <th>状态</th><th>客户端</th>
+            </tr>
+          </thead>
+          <tbody id="history-body"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button class="btn small" id="page-prev">上一页</button>
+        <span id="page-info" class="mono">—</span>
+        <button class="btn small" id="page-next">下一页</button>
+      </div>
+
+    </section>
+  </section>
+
+  <!-- ══ 引擎 ═══════════════════════════════════════════════════════════ -->
+  <section class="tab-panel" data-panel="engine" hidden>
+    <section class="card control">
+      <div class="card-head">
+        <h2>引擎控制</h2>
+        <span class="hint" id="ctrl-hint">—</span>
+      </div>
+
+      <div class="control-grid">
+        <div class="seg" id="engine-seg" role="tablist">
+          <button data-engine="vllm" class="active">vLLM</button>
+          <button data-engine="ninfer">NInfer</button>
+        </div>
+
+        <label class="field">
+          <span>Profile</span>
+          <select id="profile"><option value="stage1">stage1</option></select>
+        </label>
+
+        <label class="field">
+          <span>Context</span>
+          <select id="ctx">
+            <option value="32k">32k</option>
+            <option value="64k">64k</option>
+            <option value="128k" selected>128k</option>
+            <option value="256k">256k</option>
+            <option value="max">max</option>
+          </select>
+        </label>
+
+        <div id="engine-options" class="engine-options"></div>
+
+        <label class="field wide">
+          <span>额外参数（透传给引擎，空格分隔）</span>
+          <input id="extra" class="mono" placeholder="--max-num-seqs 192" autocomplete="off" />
+        </label>
+
+        <div class="actions">
+          <button class="btn" id="btn-dry">预览命令</button>
+          <button class="btn" id="btn-probe">契约探针</button>
+          <label class="check" title="额外真实请求 /v1/responses 与 /v1/messages；某些引擎版本会因此进入 unavailable">
+            <input type="checkbox" id="probe-extended" /> 含 extended
+          </label>
+          <button class="btn warn" id="btn-restart">重启</button>
+          <button class="btn danger" id="btn-stop">停止</button>
+          <button class="btn primary" id="btn-apply">应用并启动</button>
+        </div>
+      </div>
+
+      <div class="startup" id="startup" hidden>
+        <div class="startup-phases" id="startup-phases"></div>
+        <pre class="well mono startup-tail" id="startup-tail"></pre>
+      </div>
+
+      <pre class="well mono cmdline" id="cmd-preview">等待操作…</pre>
+      <div class="probe-results" id="probe-results"></div>
+    </section>
+
+    <section class="engine-bottom">
+      <div class="card info-card">
+        <div class="card-head"><h2>引擎信息</h2><span class="hint" id="info-engine">—</span></div>
+        <dl class="kv" id="engine-info"></dl>
+      </div>
+      <div class="card info-card">
+        <div class="card-head">
+          <h2>引擎日志</h2>
+          <button class="btn small" id="btn-logs">刷新</button>
+        </div>
+        <pre class="well mono logs" id="log-tail">—</pre>
+      </div>
+    </section>
+  </section>
+
+  <!-- ══ Docker ═════════════════════════════════════════════════════════ -->
+  <section class="tab-panel" data-panel="docker" hidden>
+    <section class="card docker-card">
+      <div class="card-head">
+        <h2>Docker · 仅 vLLM</h2>
+        <div class="filters">
+          <span class="chip mono" id="docker-scope">—</span>
+          <span class="chip mono" id="docker-disk">—</span>
+          <button class="btn small" id="btn-docker-refresh">刷新</button>
+        </div>
+      </div>
+      <div class="docker-grid">
+        <div class="docker-col">
+          <h3>容器</h3>
+          <div id="docker-containers" class="docker-items"></div>
+          <p class="docker-note" id="docker-note"></p>
+        </div>
+        <div class="docker-col wide">
+          <h3>镜像</h3>
+          <div class="table-wrap">
+            <table class="history images">
+              <thead>
+                <tr>
+                  <th>镜像 / tag</th><th>ID</th><th class="num">大小</th><th>创建</th>
+                  <th>使用中</th><th>状态</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="docker-images"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="docker-col">
+          <h3>拉取 / 更新</h3>
+          <label class="field">
+            <span>镜像引用</span>
+            <input id="docker-ref" class="mono" autocomplete="off" />
+          </label>
+          <div class="actions left">
+            <button class="btn small primary" id="btn-docker-pull">拉取 / 检查更新</button>
+            <button class="btn small warn" id="btn-docker-prune">清理可删除</button>
+            <button class="btn small danger" id="btn-docker-cancel" hidden>取消拉取</button>
+          </div>
+          <pre class="well mono docker-log" id="docker-log">—</pre>
+        </div>
+      </div>
+      <div class="docker-ledger" id="docker-ledger" hidden>
+        <h3>镜像账本 <span class="hint">monitor 拉取/取代记录 — 决定哪些悬空镜像可删</span></h3>
+        <div class="table-wrap">
+          <table class="history ledger">
+            <thead>
+              <tr><th>镜像 ID</th><th>引用</th><th>首次记录</th><th>被取代</th><th>已删除</th><th>来源</th></tr>
+            </thead>
+            <tbody id="ledger-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </section>
+</main>
+
+<!-- ── detail drawer ───────────────────────────────────────────────────── -->
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-head">
+    <h2>请求详情</h2>
+    <button class="icon-btn" id="drawer-close">✕</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+<div class="scrim" id="scrim"></div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="/static/vendor/uPlot.iife.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

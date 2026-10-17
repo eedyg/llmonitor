@@ -1,0 +1,146 @@
+# Declarative description of the NInfer engine (native process, no container).
+# Extracted from ../run_llm.sh; tools/parity.py proves equivalence.
+
+name: ninfer
+kind: process
+
+container_name: ninfer-qwen38
+binary: "${project_dir}/ninfer/build/apps/ninfer-serve"
+artifact: "${project_dir}/ninfer/out/qwen3_8_27b_nvfp4.ninfer"
+default_ctx: "256k"
+model_max_context: 262144
+served_model_name: "qwen3.8-27b"
+
+defaults:
+  max_concurrency: "2"
+  kv_dtype: ""            # empty → follow kv_cache_dtype (fp8), 'auto' → fp8
+  device_state_slots: "2"
+  kv_capacity: ""         # empty → equal to the context ceiling
+  host_context_mib: ""
+  preserve_thinking: "1"
+  vision: "0"
+  cors: "1"
+  lm_head_draft: "1"
+  spec_tokens:
+    stage1: null
+    mtp: "3"
+    dflash: "7"
+    dflash2: "7"
+
+engine_args:
+  - "${artifact}"
+  - "--host"
+  - "${host}"
+  - "--port"
+  - "${port}"
+  - "--model-id"
+  - "${served_model_name}"
+  - "--max-context"
+  - "${ctx}"
+  - "--kv-capacity"
+  - "${kv_capacity}"
+  - "--max-concurrency"
+  - "${max_concurrency}"
+  - "--kv-dtype"
+  - "${kv_dtype}"
+  - "--device-state-slots"
+  - "${device_state_slots}"
+
+conditional_args:
+  - when: {host_context_mib: {truthy: true}}
+    args: ["--host-context-mib", "${host_context_mib}"]
+  - when: {api_key: {truthy: true}}
+    args: ["--api-key", "${api_key}"]
+  - when: {cors: {truthy: true}}
+    args: ["--cors"]
+  - when: {preserve_thinking: {truthy: true}}
+    args: ["--preserve-thinking"]
+  - when: {vision: {truthy: true}}
+    args: ["--vision"]
+
+profiles:
+  stage1: {}
+  mtp:
+    args: ["--spec", "mtp", "--draft-tokens", "${spec_tokens}"]
+    lm_head_draft: true
+  dflash:
+    args: ["--spec", "dflash", "--draft-tokens", "${spec_tokens}"]
+    lm_head_draft: true
+  dflash2:
+    args: ["--spec", "dflash2", "--draft-tokens", "${spec_tokens}"]
+    lm_head_draft: true
+
+unsupported_profiles:
+  kv2: "Profile 'kv2' is vLLM-only (host KV offload); NInfer keeps KV on the device."
+  kv3: "Profile 'kv3' is vLLM-only (host+disk KV offload); NInfer keeps KV on the device."
+
+options:
+  - key: kv_dtype
+    label: "KV 类型"
+    type: enum
+    choices: [fp8, bf16, int8, nvfp4, k8v4]
+    choice_labels:
+      fp8: "fp8（默认）"
+      bf16: "bf16（最准）"
+      int8: "int8"
+      nvfp4: "nvfp4"
+      k8v4: "k8v4"
+    default: fp8
+    hint: "fp8 省显存；bf16 精度最高"
+  - key: max_concurrency
+    label: "并发 lane"
+    type: int
+    default: 2
+  - key: kv_capacity
+    label: "KV 池 (tokens)"
+    type: string
+    default: ""
+    placeholder: "默认 = ctx"
+    hint: "auto / 131072 / 256k"
+  - key: device_state_slots
+    label: "额外状态槽"
+    type: int
+    default: 2
+  - key: host_context_mib
+    label: "Host context (MiB)"
+    type: string
+    default: ""
+    placeholder: "自动"
+  - key: spec_tokens
+    label: "投机 token 数"
+    type: int
+    default: null
+    placeholder: "profile 默认（mtp 3 / dflash 7）"
+    show_if: {profiles: [mtp, dflash, dflash2]}
+  - key: preserve_thinking
+    label: "保留历史 thinking"
+    type: bool
+    default: "1"
+  - key: vision
+    label: "Vision"
+    type: bool
+    default: "0"
+  - key: cors
+    label: "CORS"
+    type: bool
+    default: "1"
+  - key: api_key
+    label: "API Key"
+    type: password
+    default: ""
+    hint: "引擎鉴权 + 网关注入；长期使用请写进 config.yaml → engine.extra_env.API_KEY"
+
+startup:
+  - {match: "starting engine", phase: "初始化"}
+  - {match: "loading weights", phase: "加载权重"}
+  - {match: "weights ready", phase: "权重就绪"}
+  - {match: "CUDA graph|host context pinned|pinning host context", phase: "CUDA Graph"}
+  - {match: "engine ready", phase: "引擎就绪"}
+  - {match: "listening on", phase: "监听中"}
+  - {match: "ERROR|failed to|Traceback|CUDA error", phase: "错误", error: true}
+
+# Set per profile above; appended after the profile args, exactly like run_llm.sh.
+profile_flags:
+  lm_head_draft:
+    when: {lm_head_draft: {truthy: true}}
+    args: ["--lm-head-draft"]
