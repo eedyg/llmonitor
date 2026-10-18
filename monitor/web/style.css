@@ -264,6 +264,121 @@ main, .topbar { position: relative; z-index: 1; max-width: 2800px; margin: 0 aut
   font-variant-numeric: tabular-nums; min-height: 17px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+.kpi-value .kpi-alt {
+  margin-left: auto; display: flex; align-items: baseline; gap: 5px;
+  padding: 3px 9px; border-radius: 999px; background: var(--surface-2);
+  box-shadow: var(--inset-sm); color: var(--muted);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.kpi-value .kpi-alt b { font-size: 13px; font-weight: 650; letter-spacing: 0; color: var(--text); }
+.kpi-value .kpi-alt small { font-size: 9.5px; letter-spacing: .3px; text-transform: none; }
+
+/* ── overview: cumulative token ledger ───────────────────────────────── */
+.token-card { margin-bottom: 22px; }
+.tok-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr) minmax(0, 1fr);
+  gap: 26px; align-items: stretch;
+}
+.tok-main {
+  display: flex; flex-direction: column; gap: 3px; justify-content: center;
+  padding-right: 26px; border-right: 1px solid var(--line);
+}
+.tok-label {
+  font-size: 10.5px; letter-spacing: 1.1px; text-transform: uppercase;
+  color: var(--muted); font-weight: 600;
+}
+.tok-value { display: flex; align-items: baseline; gap: 8px; margin-top: 2px; }
+.tok-value b {
+  font-size: 34px; font-weight: 650; letter-spacing: -.8px; color: var(--text-strong);
+  font-variant-numeric: tabular-nums; line-height: 1.15;
+}
+.tok-value small { font-size: 11px; color: var(--muted); letter-spacing: .4px; }
+.tok-sub { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.tok-split { display: flex; flex-direction: column; gap: 9px; justify-content: center; }
+.tok-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.tok-head b {
+  font-size: 19px; font-weight: 650; letter-spacing: -.3px; color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+}
+.tok-bar {
+  display: flex; height: 10px; border-radius: 99px; overflow: hidden;
+  background: var(--surface-2); box-shadow: var(--inset-sm);
+}
+.tok-bar i { display: block; height: 100%; width: 0; transition: width .45s ease; }
+.tok-bar .seg-hit { background: var(--good); }
+.tok-bar .seg-miss { background: var(--warn); }
+.tok-bar .seg-think { background: var(--violet); }
+.tok-bar .seg-content { background: var(--accent); }
+.tok-legend {
+  display: flex; flex-wrap: wrap; gap: 4px 16px;
+  font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
+}
+.tok-legend span { display: flex; align-items: center; gap: 6px; }
+.tok-legend b { color: var(--text); font-weight: 600; }
+.tok-legend em { font-style: normal; color: var(--muted); }
+.tok-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.tok-dot.hit { background: var(--good); }
+.tok-dot.miss { background: var(--warn); }
+.tok-dot.think { background: var(--violet); }
+.tok-dot.content { background: var(--accent); }
+
+/* money strip: API-equivalent cost + GPU electricity, always one line */
+.tok-money {
+  display: flex; align-items: baseline; gap: 12px;
+  margin-top: 18px; padding: 11px 16px; border-radius: var(--r-md);
+  background: var(--surface-2); box-shadow: var(--inset-sm);
+  white-space: nowrap; overflow-x: auto; scrollbar-width: thin;
+}
+.money-item { display: inline-flex; align-items: baseline; gap: 7px; flex: none; }
+.money-item b {
+  font-size: 20px; font-weight: 650; letter-spacing: -.4px; color: var(--text-strong);
+  font-variant-numeric: tabular-nums; line-height: 1.2;
+}
+.money-item small { font-size: 10px; color: var(--muted); }
+.money-item em {
+  font-style: normal; font-size: 11px; color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.money-sep { flex: none; width: 1px; align-self: stretch; background: var(--line); }
+@media (max-width: 900px) {
+  .money-item b { font-size: 17px; }
+  .money-item em { font-size: 10.5px; }
+}
+
+.token-card .card-head { margin-bottom: 18px; }
+.token-card #tok-hint { margin-right: auto; }
+.tok-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tok-controls input {
+  height: 32px; border: 0; border-radius: 9px; padding: 0 10px;
+  background: var(--surface-2); color: var(--text); box-shadow: var(--inset-sm);
+  font-size: 11.5px; font-family: var(--mono); outline: none;
+}
+.tok-controls input::-webkit-calendar-picker-indicator { opacity: .55; cursor: pointer; }
+.tok-controls .btn { height: 32px; padding: 0 12px; font-size: 11.5px; }
+.tok-dash { color: var(--muted); font-size: 11px; }
+.tok-days-wrap {
+  margin-top: 18px; max-height: 300px; overflow: auto; border-radius: var(--r-md);
+}
+table.tok-days { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+table.tok-days th {
+  position: sticky; top: 0; z-index: 1; background: var(--surface);
+  text-align: right; font-size: 9.5px; letter-spacing: .8px; text-transform: uppercase;
+  color: var(--muted); font-weight: 600; padding: 8px 10px; white-space: nowrap;
+  border-bottom: 1px solid var(--line);
+}
+table.tok-days th:first-child, table.tok-days td:first-child { text-align: left; }
+table.tok-days td {
+  padding: 7px 10px; text-align: right; white-space: nowrap;
+  font-variant-numeric: tabular-nums; color: var(--text);
+  border-bottom: 1px solid var(--line);
+}
+table.tok-days td.mono { font-family: var(--mono); color: var(--muted); }
+table.tok-days td.strong { color: var(--text-strong); font-weight: 600; }
+table.tok-days td.dim { color: var(--muted); }
+table.tok-days td.good { color: var(--good); }
+table.tok-days td.money { color: var(--accent); font-weight: 600; }
+table.tok-days tbody tr:last-child td { border-bottom: 0; }
 
 /* ── charts ───────────────────────────────────────────────────────────── */
 .charts {
@@ -480,6 +595,11 @@ table.history .engine-tag.ninfer { color: var(--violet); }
   .triple { grid-template-columns: 1fr; }
   .control-grid { grid-template-columns: 1fr 1fr; }
   .control-grid .wide { grid-column: 1 / -1; }
+  .tok-row { grid-template-columns: 1fr 1fr; }
+  .tok-main {
+    grid-column: 1 / -1; padding-right: 0; padding-bottom: 14px;
+    border-right: 0; border-bottom: 1px solid var(--line);
+  }
 }
 @media (max-width: 680px) {
   body { padding: 0 14px 40px; }
@@ -488,6 +608,7 @@ table.history .engine-tag.ninfer { color: var(--violet); }
   .control-grid .wide { grid-column: span 1; }
   .live-list { grid-template-columns: 1fr; }
   .topbar { padding-top: 16px; }
+  .tok-row { grid-template-columns: 1fr; }
 }
 
 /* accessibility: honour reduced motion (also used for headless screenshots) */

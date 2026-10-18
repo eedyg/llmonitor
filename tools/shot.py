@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Screenshot a URL through the Chrome DevTools Protocol (waits for real network).
 
-usage: shot.py URL OUT.png [--width 1600] [--height 3400] [--wait 3]
+usage: shot.py URL OUT.png [--width 1600] [--height 3400] [--wait 3] [--eval "js"]
+
+--eval runs JavaScript in the page after the first wait (and waits again), which
+is how the UI states that need a click (filters, date range, drawers) get shot.
 """
 
 from __future__ import annotations
@@ -20,7 +23,8 @@ import websockets
 CHROME = shutil.which("chromium") or "/snap/bin/chromium"
 
 
-async def capture(url: str, out: str, width: int, height: int, wait: float, port: int) -> None:
+async def capture(url: str, out: str, width: int, height: int, wait: float, port: int,
+                 script: str | None = None) -> None:
     proc = subprocess.Popen(
         [
             CHROME, "--headless=new", "--no-sandbox", "--disable-gpu",
@@ -66,6 +70,13 @@ async def capture(url: str, out: str, width: int, height: int, wait: float, port
             })
             await call("Page.navigate", {"url": url})
             await asyncio.sleep(wait)
+            if script:
+                result = await call("Runtime.evaluate", {
+                    "expression": script, "awaitPromise": True, "returnByValue": True,
+                })
+                if result.get("result", {}).get("exceptionDetails"):
+                    print(f"eval error: {result['result']['exceptionDetails']}", file=sys.stderr)
+                await asyncio.sleep(wait)
             shot = await call("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True})
             data = shot.get("result", {}).get("data")
             if not data:
@@ -86,6 +97,7 @@ def main() -> None:
     out = sys.argv[2]
     width = height = None
     wait = 3.0
+    script = None
     args = sys.argv[3:]
     for i, arg in enumerate(args):
         if arg == "--width":
@@ -94,7 +106,9 @@ def main() -> None:
             height = int(args[i + 1])
         elif arg == "--wait":
             wait = float(args[i + 1])
-    asyncio.run(capture(url, out, width or 1600, height or 3400, wait, 9223))
+        elif arg == "--eval":
+            script = args[i + 1]
+    asyncio.run(capture(url, out, width or 1600, height or 3400, wait, 9223, script))
 
 
 if __name__ == "__main__":

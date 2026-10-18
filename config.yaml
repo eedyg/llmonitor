@@ -43,6 +43,7 @@ engine:
   health_timeout_s: 1800
   health_poll_s: 2.0
   # Ask run_llm.sh to start NInfer with the full-precision JSONL request log.
+  # It is trimmed by the `logs` section below (NInfer itself never rotates it).
   ninfer_jsonl: true
   ninfer_jsonl_path: "../run/ninfer-requests.jsonl"
   ninfer_stats_interval_ms: 1000
@@ -76,6 +77,39 @@ storage:
   text_cap_bytes: 2097152
   # Metadata retention.
   retention_days: 30
+  # Hard size cap on the sqlite file (MB, 0 = no cap). retention_days already
+  # bounds the age of a row; this bounds the size if the request rate is high
+  # enough to out-grow the disk inside that window. Oldest rows go first and
+  # the freed pages are handed back with incremental_vacuum (no 2x VACUUM).
+  max_db_mb: 512
+
+# Keeps every log this program writes from growing without a bound.
+# Logs are trimmed in place (keep the tail, drop the head), never renamed:
+# the engine holds an O_APPEND fd and must keep writing into the same inode.
+logs:
+  max_log_mb: 64          # run/<engine>.log (engine stdout) + run/monitor.log
+  keep_tail_mb: 8         # how much of the tail survives a trim
+  lifecycle_max_mb: 8     # state/lifecycle.log (docker start/stop transcripts)
+  jsonl_max_mb: 64        # NInfer --request-log-jsonl file
+  check_interval_s: 30    # how often the maintenance loop looks
+
+# 金额换算（只读展示，不影响任何采集）。
+# DeepSeek 官方 2026-09-10 价目表，人民币 / 百万 token，以下是「高峰价」：
+#   输入·缓存命中 0.04 元   输入·缓存未命中 2.00 元   输出 8.00 元
+#   空闲时段 = 高峰 × 0.5；高峰 = 北京时间周一至周五 9:00-12:00、14:00-18:00
+#   （中国法定节假日未建模，一年约 10 天会算错，误差几个百分点）
+billing:
+  deepseek:
+    model: "deepseek-flash"
+    cache_hit: 0.04
+    cache_miss: 2.0
+    output: 8.0
+    offpeak_factor: 0.5
+    peak_hours: [9, 10, 11, 14, 15, 16, 17]   # 北京时间
+  electricity:
+    # 成都：居民一档 0.5224，一般工商业单一制平段 ~0.6125（国网四川 2026-10）。
+    # 只统计显卡自身功耗（NVML），不含 CPU / 电源损耗 / 机箱风扇。
+    cny_per_kwh: 0.6
 
 gpu:
   # Use nvidia-smi CSV if NVML cannot be loaded.

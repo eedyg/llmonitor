@@ -21,6 +21,7 @@ import httpx
 
 from . import launcher
 from .launcher import LaunchPlan
+from .maintenance import tail_lines
 from .runtime import Runtime
 
 
@@ -563,9 +564,14 @@ class Controller:
         name = self.cfg.root.engine.container_names.ninfer
         path = self.run_dir / f"{name}.log"
         try:
+            size = path.stat().st_size
+        except OSError:
+            return []
+        # maintenance may trim the file under us: never seek past EOF
+        start = 0 if size < self._log_offset else self._log_offset
+        try:
             with path.open("rb") as handle:
-                if self._log_offset:
-                    handle.seek(self._log_offset)
+                handle.seek(start)
                 blob = handle.read()
         except OSError:
             return []
@@ -834,8 +840,9 @@ class Controller:
             path = self.run_dir / f"{name}.log"
             if not path.exists():
                 return {"engine": kind, "source": str(path), "lines": [], "error": "no log file"}
-            lines = path.read_text(errors="replace").splitlines()[-tail:]
-            return {"engine": kind, "source": str(path), "lines": lines}
+            # tail only: the file is trimmed by maintenance, but it is never read
+            # whole (a multi-GB engine log would otherwise land in memory)
+            return {"engine": kind, "source": str(path), "lines": tail_lines(path, tail)}
         return {"engine": None, "source": None, "lines": [], "error": "engine is not running"}
 
     # -- subprocess ---------------------------------------------------------

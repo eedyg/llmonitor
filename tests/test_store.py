@@ -63,3 +63,121 @@ def test_series_ring(tmp_path):
     data = store.series(since=now - 1)
     assert data["ts"] == [round(now, 3), round(now + 1, 3), round(now + 2, 3)]
     assert data["decode_tps"] == [0, 1, 2]
+
+
+def test_token_totals_ledger(tmp_path):
+    store = Store(tmp_path / "m.db")
+
+    def add(prompt, cached, thinking, content, started_at):
+        rec = Record(protocol=CHAT, engine="vllm", endpoint="/v1/chat/completions")
+        rec.started_at = started_at
+        rec.finished_at = started_at + 0.2
+        rec.status = 200
+        rec.prompt_tokens = prompt
+        rec.prompt_cached = cached
+        rec.thinking_tokens = thinking
+        rec.content_tokens = content
+        store.add(rec)
+
+    now = time.time()
+    add(100, 60, 30, 70, now)
+    add(50, 0, 0, 25, now + 1)
+    add(10, 0, 0, 5, store.started_at - 100)  # predates this process
+    store.started_at -= 60  # pretend the process has been up for a minute
+
+    totals = store.token_totals()
+    session, history = totals["session"], totals["history"]
+    assert session["requests"] == 2                      # session = since start
+    assert (session["prompt"], session["prompt_cached"], session["prompt_miss"]) == (150, 60, 90)
+    assert (session["output"], session["thinking"], session["content"]) == (125, 30, 95)
+    assert session["total"] == 275                       # in + out
+    assert session["cache_hit_pct"] == 40.0
+    assert session["cache_estimated"] is False
+    assert session["uptime_s"] >= 59 and session["tps"] == 4.58
+    assert history["requests"] == 3                      # everything retained
+    assert history["total"] == 290
+    assert history["cache_hit_pct"] == 37.5
+
+
+def test_token_totals_estimate_cache_when_engine_omits_it(tmp_path):
+    store = Store(tmp_path / "m.db")
+    rec = Record(protocol=CHAT, engine="vllm", endpoint="/v1/chat/completions")
+    rec.started_at = time.time()
+    rec.status = 200
+    rec.prompt_tokens = 1000
+    rec.prompt_cached = None  # vLLM did not report cached_tokens
+    rec.content_tokens = 10
+    store.add(rec)
+
+    scope = store.token_totals(cache_ratio=0.8)["session"]
+    assert scope["prompt_cached"] == 800
+    assert scope["prompt_miss"] == 200
+    assert scope["cache_estimated"] is True
+
+    scope = store.token_totals(cache_ratio=None)["session"]
+    assert scope["prompt_cached"] == 0
+    assert scope["cache_estimated"] is False
+
+
+def test_token_range_per_day(tmp_path):
+    from datetime import date, timedelta
+
+    from monitor.store import day_window
+
+    store = Store(tmp_path / "m.db")
+    day1 = date(2026, 10, 1)
+    day2 = day1 + timedelta(days=1)
+    day4 = day1 + timedelta(days=3)
+    s1, _ = day_window(day1.isoformat(), day1.isoformat())
+    s2, _ = day_window(day2.isoformat(), day2.isoformat())
+    s4, _ = day_window(day4.isoformat(), day4.isoformat())
+    since, until = day_window("2026-10-01", "2026-10-03")
+
+    def add(prompt, thinking, content, started_at):
+        rec = Record(protocol=CHAT, engine="vllm", endpoint="/v1/chat/completions")
+        rec.started_at = started_at
+        rec.finished_at = started_at + 0.1
+        rec.status = 200
+        rec.prompt_tokens = prompt
+        rec.thinking_tokens = thinking
+        rec.content_tokens = content
+        store.add(rec)
+
+    add(100, 10, 20, s1 + 3600)          # 10-01 midday
+    add(300, 30, 40, s2 + 7200)          # 10-02
+    add(999, 99, 99, s4 + 3600)          # 10-04: outside the window
+
+    data = store.token_range(since, until)
+    assert [d["date"] for d in data["daily"]] == ["2026-10-01", "2026-10-02", "2026-10-03"]
+    assert data["daily"][0]["total"] == 130
+    assert data["daily"][1]["total"] == 370
+    assert data["daily"][2]["total"] == 0        # zero-filled quiet day
+    assert data["scope"]["requests"] == 2
+    assert data["scope"]["total"] == 500
+    assert data["scope"]["prompt"] == 400
+    assert data["scope"]["output"] == 100
+
+
+def test_token_range_estimates_cache_per_day(tmp_path):
+    from datetime import date
+
+    from monitor.store import day_window
+
+    store = Store(tmp_path / "m.db")
+    since, until = day_window("2026-10-05", "2026-10-06")
+    for day in (0, 1):
+        rec = Record(protocol=CHAT, engine="vllm", endpoint="/v1/chat/completions")
+        rec.started_at = since + day * 86400 + 60
+        rec.status = 200
+        rec.prompt_tokens = 1000
+        rec.content_tokens = 10
+        store.add(rec)
+
+    data = store.token_range(since, until, cache_ratio=0.75)
+    assert data["scope"]["cache_estimated"] is True
+    assert data["scope"]["prompt_cached"] == 1500
+    assert [d["prompt_cached"] for d in data["daily"]] == [750, 750]
+    # no ratio -> reported zeros, not a guess
+    plain = store.token_range(since, until)
+    assert plain["scope"]["prompt_cached"] == 0
+    assert plain["scope"]["cache_estimated"] is False

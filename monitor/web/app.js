@@ -6,6 +6,7 @@
   const MAX_POINTS = 3600;
 
   const TAB_KEY = "llm-monitor-tab";
+  const TOK_RANGE_KEY = "llm-monitor-token-range";
   const TABS = ["overview", "requests", "engine", "docker"];
 
   const state = {
@@ -20,6 +21,8 @@
     charts: [],
     schemas: {},
     userPickedEngine: false,
+    tokenRange: null,     // /api/tokens response when a date range is applied
+    renderedRange: null,
     ts: [],
     series: {},          // key -> array aligned with ts
     historyTimer: null,
@@ -50,6 +53,58 @@
   function fmtInt(value, dash = "—") {
     if (value === null || value === undefined) return dash;
     return Number(value).toLocaleString("en-US");
+  }
+
+  function fmtTok(value, dash = "—") {
+    if (value === null || value === undefined) return dash;
+    const n = Number(value);
+    if (!Number.isFinite(n)) return dash;
+    if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(2) + "B";
+    if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(2) + "M";
+    return n.toLocaleString("en-US");
+  }
+
+  function fmtMoney(value) {
+    if (value === null || value === undefined) return "—";
+    const n = Number(value);
+    if (!Number.isFinite(n)) return "—";
+    if (n !== 0 && Math.abs(n) < 0.01) return n.toFixed(4);
+    return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  function fmtKwh(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n === 0) return "0";
+    if (n >= 100) return n.toFixed(0);
+    if (n >= 1) return n.toFixed(2);
+    if (n >= 0.01) return n.toFixed(3);
+    return String(Number(n.toPrecision(2)));
+  }
+
+  function fmtUptime(seconds) {
+    const total = Math.max(0, Math.floor(Number(seconds) || 0));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h) return `${h}h${String(m).padStart(2, "0")}m`;
+    if (m) return `${m}m${String(s).padStart(2, "0")}s`;
+    return `${s}s`;
+  }
+
+  function todayIso() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }
+
+  function fmtDaySpan(firstAt, lastAt) {
+    if (!firstAt || !lastAt) return "—";
+    const fmt = (ts) => {
+      const d = new Date(Number(ts) * 1000);
+      return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    };
+    const a = fmt(firstAt);
+    const b = fmt(lastAt);
+    return a === b ? a : `${a} → ${b}`;
   }
 
   function fmtBytes(n) {
@@ -375,6 +430,7 @@
     renderEngineInfo(snap);
     renderGpu(snap);
     renderSummary(snap);
+    renderTokens(snap);
     updateTabStatus(ctrl, snap.live || []);
     if (state.tab === "requests") renderLive(snap.live || []);
 
@@ -415,8 +471,10 @@
     const gpu = (snap.gpu && snap.gpu.gpus && snap.gpu.gpus[0]) || {};
 
     $("#k-decode").textContent = fmt(speed.decode_tps, 1);
+    $("#k-decode-1m").textContent = fmt(speed.decode_tps_60s, 1);
     $("#k-decode-sub").textContent = `ITL ${fmt(speed.itl_p50_ms, 1)}ms · 累计 ${fmtInt(tokens.generation)} tok`;
     $("#k-prefill").textContent = fmt(speed.prefill_tps, 0);
+    $("#k-prefill-1m").textContent = fmt(speed.prefill_tps_60s, 0);
     $("#k-prefill-sub").textContent = `prompt 均值 ${fmt(speed.prompt_tokens_avg, 0)} tok`;
     $("#k-ttft").textContent = fmt(speed.ttft_p50_ms, 0);
     $("#k-ttft-sub").textContent = `p90 ${fmt(speed.ttft_p90_ms, 0)} · p99 ${fmt(speed.ttft_p99_ms, 0)} ms`;
@@ -487,8 +545,187 @@
     }
   }
 
-  function renderSummary(snap) {
-    const summary = snap.summary || {};
+  /* Cumulative token ledger: total (in+out) -> prompt / output -> hit|miss,
+     thinking|content. Sourced from the SQLite request rows (read-only).
+     Falls back to a date-range aggregate when the picker is applied. */
+  function renderTokens(snap) {
+    const totals = snap.tokens || {};
+    const range = state.tokenRange;
+    const session = totals.session || {};
+    const history = totals.history || {};
+    // Default view is the DB-backed total: it survives restarts, which is the
+    // whole point of the ledger. "This run" lives in the sub-line.
+    const s = (range ? range.scope : history) || {};
+    const set = (sel, text, title) => {
+      const node = $(sel);
+      if (!node) return;
+      node.textContent = text;
+      node.title = title || "";
+    };
+    const pct = (part, whole) => (whole > 0 ? (100 * Number(part || 0)) / whole : null);
+    const pctText = (value) => (value == null ? "" : `${fmt(value, 1)}%`);
+    const approx = s.cache_estimated ? "≈" : "";
+
+    if (range) {
+      set("#tok-hint", `${range.start} → ${range.end} · ${range.days} 天`,
+          `按本地时区整天聚合，含首尾两天；共 ${fmtInt(s.requests)} 个请求`);
+    } else if (s.requests) {
+      set("#tok-hint", `库内累计 · ${fmtDaySpan(s.first_at, s.last_at)}`,
+          `state/monitor.db 里保留的全部请求（30 天保留期）· ${fmtInt(s.total)} tok`);
+    } else {
+      set("#tok-hint", "库内暂无记录", "还没有任何已完成的请求");
+    }
+    set("#tok-total", fmtTok(s.total), `${fmtInt(s.total)} tok（in + out）`);
+    if (range) {
+      const perDay = range.days > 0 ? Number(s.total || 0) / range.days : null;
+      set("#tok-total-sub", `${fmtInt(s.requests)} 个请求 · 日均 ${fmtTok(perDay)} tok`,
+          `按天汇总，共 ${range.days} 天`);
+    } else {
+      set("#tok-total-sub", `${fmtInt(s.requests)} 个请求 · 本次运行 ${fmtTok(session.total)} tok`,
+          `本次运行 ${fmtUptime(session.uptime_s)} · ${fmtInt(session.requests)} 个请求 · ${fmtInt(session.total)} tok`);
+    }
+
+    set("#tok-prompt", fmtTok(s.prompt), `${fmtInt(s.prompt)} tok`);
+    set("#tok-output", fmtTok(s.output), `${fmtInt(s.output)} tok`);
+
+    const inPct = pct(s.prompt_cached, s.prompt);
+    const hitBar = $("#tok-in-hit-bar");
+    const missBar = $("#tok-in-miss-bar");
+    if (hitBar && missBar) {
+      hitBar.style.width = inPct == null ? "0%" : `${inPct}%`;
+      missBar.style.width = inPct == null ? "0%" : `${100 - inPct}%`;
+    }
+    set("#tok-in-hit", `${approx}${fmtInt(s.prompt_cached)}`,
+        s.cache_estimated
+          ? "vLLM 响应里没有 cached_tokens，按引擎侧命中率估算"
+          : `${fmtInt(s.prompt_cached)} tok`);
+    set("#tok-in-miss", `${approx}${fmtInt(s.prompt_miss)}`);
+    set("#tok-in-hit-pct", pctText(inPct));
+    set("#tok-in-miss-pct", inPct == null ? "" : pctText(100 - inPct));
+
+    const thPct = pct(s.thinking, s.output);
+    const thBar = $("#tok-out-think-bar");
+    const ctBar = $("#tok-out-content-bar");
+    if (thBar && ctBar) {
+      thBar.style.width = thPct == null ? "0%" : `${thPct}%`;
+      ctBar.style.width = thPct == null ? "0%" : `${100 - thPct}%`;
+    }
+    set("#tok-thinking", fmtInt(s.thinking), `${fmtInt(s.thinking)} tok`);
+    set("#tok-content", fmtInt(s.content), `${fmtInt(s.content)} tok`);
+    set("#tok-thinking-pct", pctText(thPct));
+    set("#tok-content-pct", thPct == null ? "" : pctText(100 - thPct));
+
+    renderTokenMoney(range, snap);
+
+    if (range !== state.renderedRange) {
+      renderTokenDays(range);
+      state.renderedRange = range;
+    }
+  }
+
+  /* Money: what these tokens would cost at the deepseek-flash rate card, plus
+     the GPU's electricity. Both are approximations, both are read-only. */
+  function renderTokenMoney(range, snap) {
+    const block = range ? (range.billing || {}) : (snap.billing || {});
+    const bill = range ? block.scope : block.history;
+    const price = block.price || (snap.billing || {}).price || {};
+    const set = (sel, text, title) => {
+      const node = $(sel);
+      if (!node) return;
+      node.textContent = text;
+      node.title = title || "";
+    };
+    const label = $("#tok-cost-ds-label");
+    if (label && price.model) label.textContent = `${price.model} 等价费用`;
+    if (!bill) {
+      // No billing block in the snapshot: the server process predates it (the
+      // static files are read from disk, so the UI can be newer than the API).
+      set("#tok-cost-ds", "—");
+      set("#tok-cost-ds-sub", "服务端未返回金额字段 · 重启 monitor 后生效",
+          "快照里没有 billing，通常是 monitor 进程还是旧代码");
+      set("#tok-cost-power", "—");
+      set("#tok-cost-power-sub", "同上");
+      return;
+    }
+    const ds = bill.deepseek || {};
+    const energy = bill.energy || {};
+    const peakPct = ds.peak_token_pct;
+    set("#tok-cost-ds", fmtMoney(ds.cost),
+        `${price.model || "deepseek"} 价目：命中 ${price.per_million?.cache_hit} / 未命中 ${price.per_million?.cache_miss} / 输出 ${price.per_million?.output} 元每百万 token（高峰价，空闲半价）`);
+    set("#tok-cost-ds-sub",
+        peakPct == null
+          ? "无 token"
+          : `高峰时段 ${fmt(peakPct, 1)}% · 全高峰价 ${fmtMoney(ds.peak_price)}`,
+        `高峰时段多花 ${fmtMoney(ds.peak_surcharge)}；全在空闲时段 ${fmtMoney(ds.offpeak_price)}`);
+    set("#tok-cost-power", fmtMoney(energy.cost),
+        `GPU 功耗积分得到的电量 × ${price.cny_per_kwh ?? "?"} 元/kWh`);
+    set("#tok-cost-power-sub",
+        energy.kwh ? `${fmtKwh(energy.kwh)} kWh × ¥${fmt(price.cny_per_kwh, 2)}`
+                   : "电量从本次升级后开始累计",
+        energy.since ? `从 ${energy.since} 开始记录` : "");
+  }
+
+  /* Per-day rows for the selected range (oldest first). */
+  function renderTokenDays(range) {
+    const wrap = $("#tok-days-wrap");
+    const table = $("#tok-days");
+    if (!wrap || !table) return;
+    if (!range || !(range.daily || []).length) {
+      wrap.hidden = true;
+      table.replaceChildren();
+      return;
+    }
+    wrap.hidden = false;
+    const head = el("tr");
+    for (const label of ["日期", "请求", "总 token", "prompt in", "命中", "未命中",
+                         "output", "thinking", "正文", "DS ¥", "电费 ¥"]) {
+      head.append(el("th", null, label));
+    }
+    const thead = el("thead");
+    thead.append(head);
+    const body = el("tbody");
+    for (const day of range.daily) {
+      const mark = day.cache_estimated ? "≈" : "";
+      const tr = el("tr");
+      tr.append(el("td", "mono", day.date));
+      tr.append(el("td", null, fmtInt(day.requests)));
+      tr.append(el("td", "strong", fmtInt(day.total)));
+      tr.append(el("td", null, fmtInt(day.prompt)));
+      tr.append(el("td", "good", `${mark}${fmtInt(day.prompt_cached)}`));
+      tr.append(el("td", "dim", `${mark}${fmtInt(day.prompt_miss)}`));
+      tr.append(el("td", null, fmtInt(day.output)));
+      tr.append(el("td", "dim", fmtInt(day.thinking)));
+      tr.append(el("td", null, fmtInt(day.content)));
+      const money = day.billing || {};
+      tr.append(el("td", "money", fmtMoney((money.deepseek || {}).cost)));
+      tr.append(el("td", "money dim", fmtMoney((money.energy || {}).cost)));
+      body.append(tr);
+    }
+    table.replaceChildren(thead, body);
+  }
+
+  async function applyTokenRange() {
+    const from = $("#tok-from").value || todayIso();
+    const to = $("#tok-to").value || from;
+    try {
+      const data = await api(`/api/tokens?start=${encodeURIComponent(from)}&end=${encodeURIComponent(to)}`);
+      state.tokenRange = data;
+      $("#tok-from").value = data.start;
+      $("#tok-to").value = data.end;
+      localStorage.setItem(TOK_RANGE_KEY, JSON.stringify({ start: data.start, end: data.end }));
+      renderTokens(state.snap || {});
+    } catch (err) {
+      toast("区间汇总失败", String(err), "bad");
+    }
+  }
+
+  function resetTokenRange() {
+    state.tokenRange = null;
+    localStorage.removeItem(TOK_RANGE_KEY);
+    renderTokens(state.snap || {});
+  }
+
+  function renderSummary(snap) {    const summary = snap.summary || {};
     const hour = summary.hour || {};
     const set = (sel, value) => { const node = $(sel); if (node) node.textContent = value; };
     set("#sum-total", fmtInt(summary.total));
@@ -755,10 +992,6 @@
   }
 
   function selectEngineButton(engine) {
-    for (const btn of document.querySelectorAll(".tab")) {
-      btn.addEventListener("click", () => activateTab(btn.dataset.tab));
-    }
-
     for (const btn of document.querySelectorAll("#engine-seg button")) {
       btn.classList.toggle("active", btn.dataset.engine === engine);
     }
@@ -1311,6 +1544,26 @@
 
     for (const btn of document.querySelectorAll(".tab")) {
       btn.addEventListener("click", () => activateTab(btn.dataset.tab));
+    }
+
+    // token ledger date range (read-only aggregation, remembered across reloads)
+    $("#tok-from").value = todayIso();
+    $("#tok-to").value = todayIso();
+    $("#tok-apply").addEventListener("click", applyTokenRange);
+    $("#tok-reset").addEventListener("click", resetTokenRange);
+    for (const id of ["#tok-from", "#tok-to"]) {
+      $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") applyTokenRange(); });
+    }
+    const savedRange = localStorage.getItem(TOK_RANGE_KEY);
+    if (savedRange) {
+      try {
+        const r = JSON.parse(savedRange);
+        if (r && r.start && r.end) {
+          $("#tok-from").value = r.start;
+          $("#tok-to").value = r.end;
+          applyTokenRange().catch(() => {});
+        }
+      } catch (err) { /* ignore a corrupt entry */ }
     }
 
     for (const btn of document.querySelectorAll("#engine-seg button")) {

@@ -20,6 +20,7 @@ from .config import Config
 from .controller import Controller
 from .engine import Metrics, adapter_for, blank, detect_kind
 from .gateway import build_gateway
+from .maintenance import maintain
 from .runtime import Runtime
 
 log = logging.getLogger("monitor")
@@ -92,8 +93,15 @@ async def gpu_loop(rt: Runtime) -> None:
 
 
 async def series_loop(rt: Runtime) -> None:
+    """1 Hz ring sample + GPU energy integration (same tick, same point)."""
+    last = time.time()
     while True:
-        rt.push_point()
+        point = rt.make_point()
+        rt.store.push_sample(point)
+        now = time.time()
+        # sqlite write is batched inside record_energy (every 5 Wh / 5 s)
+        rt.store.record_energy(point.get("power_w"), now - last, now)
+        last = now
         await asyncio.sleep(1.0)
 
 
@@ -105,6 +113,17 @@ async def controller_loop(rt: Runtime) -> None:
         except Exception as exc:  # pragma: no cover
             log.debug("controller loop error: %s", exc)
         await asyncio.sleep(interval)
+
+
+async def maintenance_loop(rt: Runtime) -> None:
+    """Keep the disk bounded: trim logs, cap the DB (see maintenance.py)."""
+    interval = max(5.0, float(rt.cfg.root.logs.check_interval_s))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(maintain, rt)
+        except Exception as exc:  # pragma: no cover - never kill the monitor
+            log.debug("maintenance error: %s", exc)
 
 
 async def jsonl_loop(rt: Runtime) -> None:
@@ -206,6 +225,7 @@ async def run(cfg: Config) -> None:
         asyncio.create_task(series_loop(rt), name="series"),
         asyncio.create_task(controller_loop(rt), name="controller"),
         asyncio.create_task(jsonl_loop(rt), name="jsonl"),
+        asyncio.create_task(maintenance_loop(rt), name="maintenance"),
     ]
 
     ui_host = str(cfg.root.server.ui_host)
@@ -262,6 +282,10 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    # httpx writes one INFO line per poll (health + /metrics every 1-2 s): that is
+    # ~7 MB/day of pure noise in whatever file our stdout points at.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     cfg = Config(args.config)
     try:
         asyncio.run(run(cfg))

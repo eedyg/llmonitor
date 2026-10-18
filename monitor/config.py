@@ -55,6 +55,33 @@ DEFAULTS: dict[str, Any] = {
         "text_keep": 200,
         "text_cap_bytes": 2 * 1024 * 1024,
         "retention_days": 30,
+        # Hard safety net on top of retention_days (0 = no cap).
+        "max_db_mb": 512,
+    },
+    "logs": {
+        # Trim (keep the tail, drop the head) once a log crosses the line.
+        "max_log_mb": 64,
+        "keep_tail_mb": 8,
+        "lifecycle_max_mb": 8,
+        "jsonl_max_mb": 64,
+        "check_interval_s": 30,
+    },
+    "billing": {
+        "deepseek": {
+            "model": "deepseek-flash",
+            # CNY per 1M tokens, PEAK rate (2026-09-10 rate card); off-peak is
+            # exactly half. Peak = Beijing time Mon-Fri 9-12, 14-18.
+            "cache_hit": 0.04,
+            "cache_miss": 2.0,
+            "output": 8.0,
+            "offpeak_factor": 0.5,
+            "peak_hours": [9, 10, 11, 14, 15, 16, 17],
+        },
+        "electricity": {
+            # Chengdu: residential tier-1 0.5224, commercial single-rate ~0.61
+            # (State Grid Sichuan, 2026-10). 0.6 is a usable middle ground.
+            "cny_per_kwh": 0.6,
+        },
     },
     "gpu": {"fallback_csv": True},
     "docker": {
@@ -119,6 +146,10 @@ _ENV_MAP = {
     "MONITOR_STATE_DIR": ("paths", "state_dir"),
     "MONITOR_DB": ("storage", "db"),
     "MONITOR_TEXT_KEEP": ("storage", "text_keep"),
+    "MONITOR_DB_MAX_MB": ("storage", "max_db_mb"),
+    "MONITOR_LOG_MAX_MB": ("logs", "max_log_mb"),
+    "MONITOR_JSONL_MAX_MB": ("logs", "jsonl_max_mb"),
+    "MONITOR_KWH_PRICE": ("billing", "electricity", "cny_per_kwh"),
     "MONITOR_FORCE_USAGE_CHUNK": ("gateway", "force_usage_chunk"),
     "MONITOR_ENGINE_DEFAULT": ("engine", "default"),
     "MONITOR_DOCKER_PULL_TIMEOUT": ("docker", "pull_timeout_s"),
@@ -134,9 +165,14 @@ class Config:
         if self.path.exists():
             raw = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
         data = _merge(DEFAULTS, raw)
-        for env_key, (section, key) in _ENV_MAP.items():
-            if env_key in os.environ:
-                data[section][key] = _coerce(data[section][key], os.environ[env_key])
+        for env_key, path in _ENV_MAP.items():
+            if env_key not in os.environ:
+                continue
+            *parents, key = path
+            node = data
+            for part in parents:
+                node = node[part]
+            node[key] = _coerce(node[key], os.environ[env_key])
         self.data = _wrap(data)
 
     # -- typed access -------------------------------------------------------

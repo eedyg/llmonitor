@@ -6,15 +6,17 @@ import asyncio
 import json
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import launcher
+from . import billing, launcher
 from .docker_scope import DockerError, ResourceInUse, ScopeViolation
 from .runtime import Runtime
+from .store import day_window
 
 WEB_DIR = Path(__file__).parent / "web"
 
@@ -23,6 +25,20 @@ def build_api(rt: Runtime) -> FastAPI:
     cfg = rt.cfg
     app = FastAPI(title="llm-monitor", docs_url="/api/docs", redoc_url=None)
     app.state.rt = rt
+
+    @app.middleware("http")
+    async def no_store(request: Request, call_next):
+        """Never let the browser cache the UI or the API.
+
+        The frontend is four unversioned files. StaticFiles answers with an ETag
+        and Last-Modified but no Cache-Control, so a browser may keep an old
+        app.js and silently half-render a page whose index.html is already new
+        (that is exactly how the money row ended up showing "—")."""
+        response = await call_next(request)
+        path = request.url.path
+        if path == "/" or path.startswith(("/static/", "/api/")):
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
 
     @app.middleware("http")
     async def auth(request: Request, call_next):
@@ -59,6 +75,21 @@ def build_api(rt: Runtime) -> FastAPI:
             since = time.time() - (window or 3600)
         wanted = [k.strip() for k in keys.split(",")] if keys else None
         return rt.store.series(since=since, keys=wanted)
+
+    @app.get("/api/tokens")
+    async def tokens(start: str | None = None, end: str | None = None) -> dict:
+        """Token ledger for a local-date window (inclusive, day precision)."""
+        try:
+            since, until = day_window(start, end)
+        except ValueError:
+            raise HTTPException(400, "start/end must be YYYY-MM-DD (or an epoch)")
+        data = rt.store.token_range(since, until, cache_ratio=rt.engine.cache_hit_ratio())
+        data["start"] = datetime.fromtimestamp(since).date().isoformat()
+        data["end"] = datetime.fromtimestamp(until - 1).date().isoformat()
+        data["days"] = len(data["daily"])
+        kwh = rt.store.energy_by_day(data["start"], data["end"])
+        data["billing"] = billing.range_report(cfg.root.billing, data, kwh)
+        return data
 
     # -- requests -----------------------------------------------------------
     @app.get("/api/requests")
@@ -420,8 +451,30 @@ def build_api(rt: Runtime) -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
     @app.get("/")
-    async def index() -> FileResponse:
-        return FileResponse(WEB_DIR / "index.html")
+    async def index() -> Response:
+        """Serve the shell with a content stamp on every asset URL.
+
+        Belt and braces on top of the no-store header: if a browser, an
+        extension or a proxy ever ignores caching headers, a changed app.js
+        still lands on a *new* URL, so a plain reload is always enough.
+        (A stale app.js next to a fresh index.html is how the money row showed
+        "—" while the backend was serving the numbers just fine.)
+        """
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        stamps = {}
+        for name in ("app.js", "style.css"):
+            try:
+                stamps[name] = int((WEB_DIR / name).stat().st_mtime)
+            except OSError:
+                stamps[name] = 0
+        for name, stamp in stamps.items():
+            html = html.replace(f'/static/{name}"', f'/static/{name}?v={stamp}"')
+        html = html.replace(
+            "<head>",
+            f'<head>\n<meta name="monitor-build" content="{max(stamps.values())}" />',
+            1,
+        )
+        return HTMLResponse(html, headers={"Cache-Control": "no-store, max-age=0"})
 
     return app
 
@@ -500,4 +553,34 @@ def render_prometheus(snap: dict) -> str:
     add("llm_gateway_requests_total", gw.get("requests"), "counter", "", "Requests through the tap")
     add("llm_gateway_in_flight", gw.get("in_flight"), "gauge", "", "In-flight requests")
     add("llm_gateway_errors_total", gw.get("errors"), "counter", "", "Gateway errors")
+
+    # Cumulative request ledger (this process, read from the history DB).
+    ledger = (snap.get("tokens") or {}).get("session") or {}
+    add("llm_monitor_tokens_total", ledger.get("total"), "counter", "",
+        "Tokens in + out recorded by this process")
+    add("llm_monitor_prompt_tokens_total", ledger.get("prompt"), "counter", "",
+        "Prompt tokens recorded by this process")
+    add("llm_monitor_prompt_tokens_cached_total", ledger.get("prompt_cached"), "counter", "",
+        "Prompt tokens served from the prefix cache")
+    add("llm_monitor_prompt_tokens_miss_total", ledger.get("prompt_miss"), "counter", "",
+        "Prompt tokens not served from the prefix cache")
+    add("llm_monitor_output_tokens_total", ledger.get("output"), "counter", "",
+        "Output tokens (thinking + content)")
+    add("llm_monitor_thinking_tokens_total", ledger.get("thinking"), "counter", "",
+        "Output tokens spent thinking")
+    add("llm_monitor_content_tokens_total", ledger.get("content"), "counter", "",
+        "Output tokens actually returned as content")
+    add("llm_monitor_requests_recorded_total", ledger.get("requests"), "counter", "",
+        "Requests recorded in the history DB by this process")
+
+    # Equivalent money (retained history, see billing.py)
+    money = (snap.get("billing") or {}).get("history") or {}
+    add("llm_monitor_api_cost_cny", (money.get("deepseek") or {}).get("cost"), "gauge", "",
+        "What the recorded tokens would cost at the deepseek-flash rate card")
+    add("llm_monitor_energy_kwh", (money.get("energy") or {}).get("kwh"), "gauge", "",
+        "GPU energy integrated over the recorded days")
+    add("llm_monitor_electricity_cost_cny", (money.get("energy") or {}).get("cost"), "gauge", "",
+        "Electricity cost of the GPU at billing.electricity.cny_per_kwh")
+    add("llm_monitor_cost_cny", money.get("total"), "gauge", "",
+        "API equivalent + electricity")
     return "\n".join(lines) + "\n"

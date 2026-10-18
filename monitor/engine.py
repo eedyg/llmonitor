@@ -20,6 +20,7 @@ class Rates:
     """Counter -> tok/s over a sliding window."""
 
     window_s: float = 10.0
+    min_span_s: float = 0.2
     series: dict[str, deque] = field(default_factory=dict)
 
     def push(self, key: str, value: float | None, now: float) -> None:
@@ -37,7 +38,7 @@ class Rates:
         t0, v0 = q[0]
         t1, v1 = q[-1]
         dt = t1 - t0
-        if dt <= 0.2:
+        if dt <= self.min_span_s:
             return None
         return max(0.0, (v1 - v0) / dt)
 
@@ -74,7 +75,8 @@ EMPTY = {
               "ttft_p90_ms": None, "ttft_p99_ms": None, "queue_p50_ms": None,
               "e2e_p50_ms": None, "e2e_p90_ms": None, "itl_p50_ms": None,
               "prefill_mean_ms": None, "decode_mean_ms": None,
-              "prompt_tokens_avg": None},
+              "prompt_tokens_avg": None, "decode_tps_60s": None,
+              "prefill_tps_60s": None},
     "spec": {"backend": None, "draft_window": None, "rounds": 0, "drafted": 0,
              "accepted": 0, "accept_rate": 0.0, "fallback": 0},
     "config": {},
@@ -95,6 +97,10 @@ class EngineStore:
 
     def __init__(self, window_s: float = 10.0) -> None:
         self.rates = Rates(window_s)
+        # Same counters over a 1 min window: the KPI's spot rate is noisy, the
+        # slow window is the smoothed figure shown next to it. The minimum span
+        # keeps the first samples from being extrapolated into a wild number.
+        self.rates_60 = Rates(60.0, min_span_s=10.0)
         self.snapshot: dict = blank()
         self.kind: str | None = None
         self.last_error: str | None = None
@@ -103,6 +109,19 @@ class EngineStore:
         self.headers: dict[str, str] = {}
         self.models: dict = {}
         self.failures: int = 0
+
+    def push_rate(self, key: str, value: float | None, now: float) -> None:
+        """Feed one counter sample into both the 10 s and the 60 s window."""
+        self.rates.push(key, value, now)
+        self.rates_60.push(key, value, now)
+
+    def cache_hit_ratio(self) -> float | None:
+        """Engine-wide prompt cache hit ratio (engine process lifetime)."""
+        tokens = self.snapshot.get("tokens") or {}
+        prompt = tokens.get("prompt") or 0
+        if prompt <= 0:
+            return None
+        return max(0.0, min(1.0, (tokens.get("prompt_cached") or 0) / float(prompt)))
 
 
 class EngineAdapter:
@@ -160,9 +179,9 @@ class VllmAdapter(EngineAdapter):
         cached = m.value("vllm:prompt_tokens_cached_total")
         local_compute = m.value("vllm:prompt_tokens_by_source_total", source="local_compute")
         generation = m.value("vllm:generation_tokens_total")
-        st.rates.push("generation", generation, now)
-        st.rates.push("prefill", local_compute if local_compute is not None else prompt, now)
-        st.rates.push("prompt", prompt, now)
+        st.push_rate("generation", generation, now)
+        st.push_rate("prefill", local_compute if local_compute is not None else prompt, now)
+        st.push_rate("prompt", prompt, now)
 
         queries = m.value("vllm:prefix_cache_queries_total") or 0.0
         hits = m.value("vllm:prefix_cache_hits_total") or 0.0
@@ -216,7 +235,9 @@ class VllmAdapter(EngineAdapter):
         }
         snap["speed"] = {
             "decode_tps": _round(st.rates.rate("generation", now), 2),
+            "decode_tps_60s": _round(st.rates_60.rate("generation", now), 2),
             "prefill_tps": _round(st.rates.rate("prefill", now), 2),
+            "prefill_tps_60s": _round(st.rates_60.rate("prefill", now), 2),
             "ttft_p50_ms": _ms(m.quantile("vllm:time_to_first_token_seconds", 0.5)),
             "ttft_p90_ms": _ms(m.quantile("vllm:time_to_first_token_seconds", 0.9)),
             "ttft_p99_ms": _ms(m.quantile("vllm:time_to_first_token_seconds", 0.99)),
@@ -280,9 +301,9 @@ class NinferAdapter(EngineAdapter):
         prefill = m.value("ninfer_prefill_tokens_total")
         generation = m.value("ninfer_generation_tokens_total")
         decode = m.value("ninfer_decode_tokens_total")
-        st.rates.push("generation", generation, now)
-        st.rates.push("prefill", prefill, now)
-        st.rates.push("decode", decode, now)
+        st.push_rate("generation", generation, now)
+        st.push_rate("prefill", prefill, now)
+        st.push_rate("decode", decode, now)
 
         pools = []
         for sample in m.samples("ninfer_device_kv_used_page_groups"):
@@ -347,7 +368,9 @@ class NinferAdapter(EngineAdapter):
         }
         snap["speed"] = {
             "decode_tps": _round(st.rates.rate("decode", now), 2),
+            "decode_tps_60s": _round(st.rates_60.rate("decode", now), 2),
             "prefill_tps": _round(st.rates.rate("prefill", now), 2),
+            "prefill_tps_60s": _round(st.rates_60.rate("prefill", now), 2),
             "ttft_p50_ms": _ms(m.quantile("ninfer_time_to_first_token_seconds", 0.5)),
             "ttft_p90_ms": _ms(m.quantile("ninfer_time_to_first_token_seconds", 0.9)),
             "ttft_p99_ms": _ms(m.quantile("ninfer_time_to_first_token_seconds", 0.99)),

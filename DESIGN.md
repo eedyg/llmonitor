@@ -70,7 +70,7 @@
   "tokens":   { "prompt", "prompt_cached", "prefill", "generation", "decode", "replayed" },
   "cache":    { "kv_pct", "kv_used_pages", "kv_capacity_pages", "prefix_queries",
                 "prefix_hits", "hit_rate", "host_used_bytes", "pools" },
-  "speed":    { "decode_tps", "prefill_tps", "ttft_p50/p90/p99_ms", "itl_p50_ms",
+  "speed":    { "decode_tps", "decode_tps_60s", "prefill_tps", "ttft_p50/p90/p99_ms", "itl_p50_ms",
                 "queue_p50_ms", "e2e_p50/p90_ms" },
   "spec":     { "backend", "draft_window", "rounds", "drafted", "accepted",
                 "accept_rate", "fallback" },
@@ -87,6 +87,7 @@
 | `cache.kv_pct` | `vllm:kv_cache_usage_perc`×100 | `used/capacity` page groups |
 | `cache.hit_rate` | `prefix_cache_hits/queries` | `prompt_cached/prompt` |
 | `speed.ttft_p50_ms` | `vllm:time_to_first_token_seconds` | `ninfer_time_to_first_token_seconds` |
+| `speed.decode_tps_60s` / `prefill_tps_60s` | 对应计数器 60 s 窗口 | 对应计数器 60 s 窗口 |
 | `spec.accept_rate` | `vllm:spec_decode_num_accepted/draft_tokens` | `ninfer_spec_decode_accepted/draft_tokens` |
 
 `/metrics` 再导出一遍为 `llm_*`（`llm_engine_up`、`llm_requests_running`、
@@ -130,6 +131,66 @@ options:
 * 新增字段零前端改动；`tests/test_launcher.py::test_schema_keys_are_known_variables`
   防止 spec 里写错 key。
 
+## 5.2 Token 累计（只读账本）
+
+总览的 Token 卡是**纯 SQL 聚合**，不写库、不维护累加器，所以永远不会和请求表对不上：
+
+```
+total = prompt + output
+prompt = COALESCE(NULLIF(prompt_tokens,0), prompt_tokens_est, 0)
+output = thinking_tokens + content_tokens
+prompt_cached / prompt_miss = 命中 / 没命中（miss = prompt - cached）
+```
+
+三种口径共用 `Store._token_scope()` + `Store._finish_scope()`：
+
+| 口径 | 范围 | 用途 |
+|---|---|---|
+| `session` | `started_at >= 进程启动` | 重启归零；放副标题 |
+| `history` | 库内保留期全部行（默认显示） | 重启不丢 |
+| `range` | `[本地 00:00, 次日 00:00)`，按天 GROUP BY | `/api/tokens?start&end` + 明细表 |
+
+`strftime('%Y-%m-%d', started_at, 'unixepoch', 'localtime')` 做分日，边界用 `time.mktime`
+推出本地零点（不用 `+86400` 硬加，DST 会错一天）。静默的日子补 0 行。
+
+**缓存命中是估算的**：vLLM 的 response usage 没有 `prompt_tokens_details.cached_tokens`，
+没有任何一行带 `prompt_cached` 时，用引擎侧 `prompt_cached/prompt` 比例乘请求侧 prompt，
+并返回 `cache_estimated=true`（UI 前缀 `≈` + tooltip）。NInfer 的
+`prefix_cache_hit_tokens` 是精确值。
+
+## 5.3 磁盘边界
+
+会自己长大的东西都有上限，`maintenance.py` 每 `logs.check_interval_s`（30 s）检查：
+
+| 文件 | 上限 | 做法 |
+|---|---|---|
+| `run/<engine>.log` | `logs.max_log_mb` 64 | 留尾部 `keep_tail_mb` 8，**原地** truncate |
+| `run/ninfer-requests.jsonl` | `logs.jsonl_max_mb` 64 | 同上（NInfer `ios::out\|app`） |
+| `state/lifecycle.log` | `logs.lifecycle_max_mb` 8 | 同上 |
+| `state/monitor.db` | `retention_days` 30 + `max_db_mb` 512 | 先按时间删 → 超硬上限删最老 10%/轮 → `incremental_vacuum` |
+
+**为什么 truncate 而不是 rename 轮转**：引擎进程继承的是 O_APPEND 的 fd，rename 之后它会
+继续写一个已 unlink 的 inode —— 磁盘不释放、日志也读不到。原地截断后 O_APPEND 会重新定位到
+新 EOF，进程无感。
+
+DB 启动时把 `auto_vacuum` 切到 `INCREMENTAL`（设了就只在下次 VACUUM 生效，所以小库立即
+VACUUM 一次），这样以后删行能真还页，而不需要 VACUUM 的 2 倍磁盘。
+
+Docker 容器日志不在我们控制面内（`/var/lib/docker`），文档里给 `--log-opt max-size/max-file`。
+
+## 5.4 金额（等价 API 费 + 电费）
+
+* **口径分离**：token 账本只回答“多少 token”，钱在两处算：`billing.token_cost()` 用
+  `billing.deepseek.*` 价目表；`store.record_energy()` 负责电量积分。UI 的三格分别是
+  DeepSeek 等价 / GPU 电费 / 合计。
+* **峰谷**：价目表是“高峰价 + 空闲半价”，所以 SQL 只多算一个 **peak 子集**
+  （`PEAK_SQL`：北京时间 `%w` 1–5 且 `%H IN (9,10,11,14,15,16,17)`），
+  混算价 = `k·P·total + (1-k)·P·peak`。法定节假日不建模（误差 ≤ 几个百分点）。
+* **电量**：`series_loop` 每秒把 `point.power_w` 交给 `record_energy()`，梯形积分成 Wh，
+  按本地日 UPSERT 进 `gpu_energy`；内存里另外存一份 session 计数。写库按 5 Wh / 5 s 批量，
+  避免 1 Hz 写盘；`dt` 上限 10 s，防止休眠/重启后凭空造电量。
+* **只算显卡**：NVML 读的是板卡功耗，不含 CPU / PSU 损耗 / 风扇 —— 文档里写明，不然会和电表对不上。
+
 ## 6. Docker 管理（仅 vLLM）
 
 * **scope**：`docker.image_repos` + `docker.containers`（默认取 `engine.container_names.vllm`）
@@ -166,7 +227,8 @@ uPlot 在面板隐藏时宽度为 0，所以**每次切到总览都会重建图�
 
 ## 9. 验收
 
-* `pytest` 42 项通过（Prometheus 解析、SSE 三协议、completions 翻译、docker scope 守卫、launcher）。
+* `pytest` 62 项通过（Prometheus 解析、SSE 三协议、completions 翻译、docker scope 守卫、
+  launcher、token 账本（区间/分日/估算）、日志截断与 DB 硬上限）。
 * `tools/parity.py` 31/31 与 `run_llm.sh` 等价。
 * 起停命令经 `--dry-run` 校验；契约探针 5 项 200。
 * 现有 vLLM 在 `:8000` 上被 adopt 后，`/api/state`、图表、历史、GPU 均正常。

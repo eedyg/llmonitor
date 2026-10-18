@@ -58,6 +58,11 @@ def _compact(snap: dict) -> dict:
     engine = snap.get("engine") or {}
     gpu = ((snap.get("gpu") or {}).get("gpus") or [{}])[0]
     ctrl = snap.get("controller") or {}
+    history = (snap.get("tokens") or {}).get("history") or {}
+    session = (snap.get("tokens") or {}).get("session") or {}
+    money = ((snap.get("billing") or {}).get("history") or {})
+    ds = money.get("deepseek") or {}
+    power = money.get("energy") or {}
     return {
         "state": ctrl.get("state"),
         "engine": ctrl.get("engine"),
@@ -79,6 +84,27 @@ def _compact(snap: dict) -> dict:
             "throttle": gpu.get("throttle"),
         },
         "live": len(snap.get("live") or []),
+        # Cumulative request ledger (SQLite) + equivalent money. The numbers in
+        # "tokens" above are the *engine's* counters, which reset with the
+        # engine process; this block covers the requests table and survives it.
+        "ledger": {
+            "requests": history.get("requests"),
+            "total_tokens": history.get("total"),
+            "prompt": history.get("prompt"),
+            "prompt_cached": history.get("prompt_cached"),
+            "prompt_miss": history.get("prompt_miss"),
+            "output": history.get("output"),
+            "thinking": history.get("thinking"),
+            "content": history.get("content"),
+            "cache_hit_pct": history.get("cache_hit_pct"),
+            "cache_estimated": history.get("cache_estimated"),
+            "first_at": history.get("first_at"),
+            "last_at": history.get("last_at"),
+            "session_total_tokens": session.get("total"),
+            "deepseek_cny": ds.get("cost"),
+            "energy_kwh": power.get("kwh"),
+            "electricity_cny": power.get("cost"),
+        },
     }
 
 
@@ -91,7 +117,11 @@ def llm_status() -> dict:
 
 @mcp.tool()
 def llm_metrics(section: str = "all") -> dict:
-    """Full normalized metrics snapshot. section: all|requests|tokens|cache|speed|spec|config."""
+    """Full normalized metrics snapshot.
+
+    section: all|requests|tokens|cache|speed|spec|config (engine counters, reset
+    with the engine process) or ledger|billing (request table + money, durable).
+    """
     snap = _get("/api/state")
     engine = snap.get("engine") or {}
     if section == "all":
@@ -100,10 +130,98 @@ def llm_metrics(section: str = "all") -> dict:
             "gpu": (snap.get("gpu") or {}).get("gpus"),
             "gateway": snap.get("gateway"),
             "summary": snap.get("summary"),
+            "ledger": snap.get("tokens"),
+            "billing": snap.get("billing"),
         }
+    if section == "ledger":
+        return {"ledger": snap.get("tokens")}
+    if section == "billing":
+        return {"billing": snap.get("billing")}
     if section in engine:
         return {section: engine.get(section)}
-    return {"error": f"unknown section '{section}'", "available": list(engine.keys())}
+    return {"error": f"unknown section '{section}'",
+            "available": list(engine.keys()) + ["ledger", "billing"]}
+
+
+@mcp.tool()
+def llm_ledger(start: str | None = None, end: str | None = None) -> dict:
+    """Cumulative token ledger from the request table (survives engine restarts).
+
+    No arguments: this process (`session`) + everything retained in SQLite
+    (`history`), each split into prompt / cached / miss / output / thinking /
+    content. With `start`/`end` (YYYY-MM-DD, local days, both inclusive) it
+    returns that window's aggregate plus one row per day.
+    """
+    if start or end:
+        data = _get("/api/tokens", start=start, end=end)
+        daily = [
+            {
+                "date": row.get("date"),
+                "requests": row.get("requests"),
+                "total": row.get("total"),
+                "prompt": row.get("prompt"),
+                "prompt_cached": row.get("prompt_cached"),
+                "prompt_miss": row.get("prompt_miss"),
+                "output": row.get("output"),
+                "thinking": row.get("thinking"),
+                "content": row.get("content"),
+                "deepseek_cny": ((row.get("billing") or {}).get("deepseek") or {}).get("cost"),
+                "energy_kwh": ((row.get("billing") or {}).get("energy") or {}).get("kwh"),
+                "electricity_cny": ((row.get("billing") or {}).get("energy") or {}).get("cost"),
+            }
+            for row in data.get("daily") or []
+        ]
+        return {
+            "start": data.get("start"),
+            "end": data.get("end"),
+            "days": data.get("days"),
+            "scope": data.get("scope"),
+            "billing": (data.get("billing") or {}).get("scope"),
+            "daily": daily,
+        }
+    snap = _get("/api/state")
+    tokens = snap.get("tokens") or {}
+    return {
+        "session": tokens.get("session"),
+        "history": tokens.get("history"),
+        "billing": (snap.get("billing") or {}).get("session"),
+        "billing_history": (snap.get("billing") or {}).get("history"),
+    }
+
+
+@mcp.tool()
+def llm_cost(start: str | None = None, end: str | None = None) -> dict:
+    """What the recorded tokens would cost at the deepseek-flash rate card, plus GPU electricity.
+
+    Two numbers with different confidence, both estimates: the API figure uses
+    the official CNY rate card with peak/off-peak split by request timestamp;
+    electricity integrates the GPU's own power samples (no CPU/PSU losses).
+    Prices come from `billing.*` in config.yaml.
+    """
+    if start or end:
+        data = _get("/api/tokens", start=start, end=end)
+        return {
+            "start": data.get("start"),
+            "end": data.get("end"),
+            "days": data.get("days"),
+            "price": (data.get("billing") or {}).get("price"),
+            "cost": (data.get("billing") or {}).get("scope"),
+            "per_day": [
+                {
+                    "date": row.get("date"),
+                    "deepseek_cny": ((row.get("billing") or {}).get("deepseek") or {}).get("cost"),
+                    "energy_cny": ((row.get("billing") or {}).get("energy") or {}).get("cost"),
+                    "total_cny": ((row.get("billing") or {}).get("scope") or {}).get("total"),
+                }
+                for row in data.get("daily") or []
+            ],
+        }
+    billing = _get("/api/state").get("billing") or {}
+    return {
+        "price": billing.get("price"),
+        "session": billing.get("session"),
+        "history": billing.get("history"),
+    }
 
 
 @mcp.tool()

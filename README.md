@@ -202,9 +202,65 @@ monitor 管 vLLM 的**容器和镜像**，不碰任何其它 docker 资源。安
 页面按逻辑拆成四个 tab，状态记在 URL hash（`#overview` / `#requests` / `#engine` / `#docker`，
 也支持 `?tab=requests`），刷新后停在上次的 tab。
 
-**总览 overview** — 8 个 KPI（decode/prefill 速度、TTFT、KV、在飞、GPU、显存、功耗）、
+**总览 overview** — 8 个 KPI（decode/prefill 速度、TTFT、KV、在飞、GPU、显存、功耗；
+decode / prefill 卡右侧各跟一个 **1 分钟均值**，来自同一计数器的 60 s 窗口）、
+**Token 累计卡**（总量 = in+out，拆成 prompt in / output，再拆成缓存命中·未命中 /
+thinking·真实输出；再换算成 **DeepSeek-flash 等价费用** 与 **GPU 电费**；
+默认库内累计，也可以选日期区间按天汇总，见下）、
 四张 1 小时趋势图（吞吐 / 延迟 / 缓存与显存 / 功耗温度）、GPU 详情卡（利用率/功耗/温度/
 风扇/时钟/PCIe/降频原因/每进程显存）。≥1900px 时一行 8 个 KPI、一行 4 张图。
+
+### Token 累计卡：数字从哪来
+
+只读，全部来自历史库（`state/monitor.db` 的 `requests` 表）的 SQL 聚合，不写任何东西：
+
+| 行 | 含义 |
+|---|---|
+| 总 Token | `prompt_tokens + thinking_tokens + content_tokens` |
+| Prompt in | `prompt_tokens`（缺失时回退 `prompt_tokens_est`） |
+| ├ 缓存命中 / 未命中 | `prompt_cached` / `prompt - prompt_cached` |
+| Output | `thinking_tokens + content_tokens` |
+| └ thinking / 真实输出 | `thinking_tokens` / `content_tokens` |
+
+两种时间口径：
+
+* **库内累计**（默认）：`state/monitor.db` 里还在保留期内的全部请求，重启不丢；副标题给出
+  本次运行（`started_at >= 进程启动时间`）的小计与 uptime，即“重启后从 0 重新数”的那个数。
+* **日期区间**：卡片右上角选起止日期（含首尾两天，本地时区，精度到天），点“查区间”
+  → `GET /api/tokens?start=2026-10-01&end=2026-10-10`，返回整段汇总 + 每天一行
+  的明细表（没流量的日子补 0）。区间会记在 localStorage，刷新后仍在；点“全部”回到库内累计。
+
+> **缓存命中为什么是 `≈`？** vLLM（至少这台机器上的 build）的 response usage 里
+> 没有 `prompt_tokens_details.cached_tokens`，逐请求命中量拿不到。这时卡片用引擎侧
+> 的命中率（`vllm:prompt_tokens_cached_total / vllm:prompt_tokens_total`）乘请求侧
+> prompt 总量，并打上 `≈` 与 tooltip。NInfer 走 JSONL 的
+> `prefix_cache_hit_tokens`，是精确值，不带 `≈`。
+
+### 金额：DeepSeek 等价 + GPU 电费
+
+两个都是**只读估算**，用来回答“这些 token 如果买 API 要多少钱”“这台卡白跑这些请求花了多少电”。
+
+**① DeepSeek-flash 等价费用**（`billing.deepseek`，人民币 / 百万 token，官方 2026-09-10 价目表）
+
+| | 缓存命中 | 缓存未命中 | 输出 |
+|---|---|---|---|
+| 高峰价 | 0.04 元 | 2.00 元 | 8.00 元 |
+| 空闲价 | 0.02 元 | 1.00 元 | 4.00 元 |
+
+高峰 = 北京时间周一至周五 9:00–12:00、14:00–18:00，其余（含周末）半价。
+所以 SQL 里按 `started_at` 多算一份 **peak 子集**，混算价 = `k·P·total + (1-k)·P·peak`
+（`k = offpeak_factor`）。中国法定节假日没建模，一年约 10 天会落到高峰档，误差几个百分点。
+
+**② GPU 电费**（`billing.electricity.cny_per_kwh`，默认 0.60 元/kWh）
+
+成都参考价：居民一档 0.5224，一般工商业单一制平段 0.6125（国网四川 2026-10）。只算**显卡自身功耗**
+（NVML 1 Hz 采样，梯形积分），不含 CPU、电源损耗（实际墙插会高 10% 左右）、机箱风扇。
+电量按本地日写进 `gpu_energy` 表（一天一行），所以能跟 token 一样按天/按区间汇总；
+升级后才有数据，历史天数显示 0 是正常的。
+
+合计 = 等价费用 + 电费（卡片第三格）。`/metrics` 里对应
+`llm_monitor_api_cost_cny` / `llm_monitor_energy_kwh` / `llm_monitor_electricity_cost_cny` /
+`llm_monitor_cost_cny`。
 
 **请求 requests** — 顶部汇总（总数 / 错误 / 近 1h 平均 decode、TTFT、prompt、输出）、
 实时请求卡片（阶段、tokens、思考与输出尾巴、实时 tok/s）、请求历史表（筛选/分页，
@@ -229,6 +285,7 @@ Tab 上有状态提示：请求 tab 显示在飞数量徽标，引擎 tab 的小
 | GET | `/api/requests/{id}` | 单条详情（含原文） |
 | GET | `/api/requests/live` | 在飞请求 |
 | GET | `/api/series?window=3600` | 时间序列 |
+| GET | `/api/tokens?start=2026-10-01&end=2026-10-10` | Token 累计（整段 + 按天 + 金额，本地日期，含首尾） |
 | GET | `/api/logs?tail=200` | 引擎日志 |
 | POST | `/api/engine/start\|stop\|restart\|switch` | 生命周期 |
 | POST | `/api/engine/probe` | 契约探针 |
@@ -242,14 +299,16 @@ Tab 上有状态提示：请求 tab 显示在飞数量徽标，引擎 tab 的小
 
 ## MCP
 
-22 个工具，和网页按钮完全等价（同一个 Controller / 同一个 docker scope）：
+独立的 MCP server（`monitor/mcp_server.py`），**24 个工具**，全部是对 `:9000` 控制面的
+薄封装：观测、验证、起停/切换引擎、压测、以及限定 scope 的 docker 操作。写操作两段式
+（不带 `confirm=true` 只回预览）。
 
-`llm_status` `llm_metrics` `llm_gpu` `llm_live_requests` `llm_requests` `llm_request`
-`llm_series` `llm_logs` `llm_probe` `llm_dry_run` `llm_start` `llm_stop` `llm_restart`
-`llm_switch` `llm_bench`，以及 docker 的 `llm_docker_status` `llm_docker_pull` `llm_docker_job`
-`llm_docker_remove_image` `llm_docker_remove_container` `llm_docker_prune` `llm_docker_restart_with`
+完整文档（每个工具的参数/返回、客户端注册、典型工作流、已知边界）见 **[MCP.md](MCP.md)**。
 
-stdio（pi / claude code / codex 直接挂）：
+```bash
+../.venv/bin/python -m monitor.mcp_server                        # stdio
+../.venv/bin/python -m monitor.mcp_server --transport http --port 9001   # /mcp
+```
 
 ```json
 {
@@ -263,14 +322,12 @@ stdio（pi / claude code / codex 直接挂）：
 }
 ```
 
-HTTP：
-
-```bash
-../.venv/bin/python -m monitor.mcp_server --transport http --port 9001
-# endpoint: http://127.0.0.1:9001/mcp
-```
-
-写操作默认只返回预览，必须 `confirm=true` 才执行。
+**观测** `llm_status`（含 `ledger` 累计与金额）`llm_metrics` `llm_ledger`（可按天）`llm_cost`
+`llm_gpu` `llm_live_requests` `llm_requests` `llm_request` `llm_series` `llm_logs`
+· **验证** `llm_probe` `llm_dry_run` · **生命周期** `llm_start` `llm_stop` `llm_restart`
+`llm_switch` · **压测** `llm_bench` · **Docker** `llm_docker_status` `llm_docker_pull`
+`llm_docker_job` `llm_docker_remove_image` `llm_docker_remove_container` `llm_docker_prune`
+`llm_docker_restart_with`
 
 ## 逐请求数据从哪来
 
@@ -321,9 +378,12 @@ monitor 是数据面单点：它挂了，`:8000` 就没了（引擎仍在 `:8001
 ## 开发
 
 ```bash
-../.venv/bin/python -m pytest -q     # 50 个单测：prom/SSE/compat/docker scope/launcher/startup/schema
+../.venv/bin/python -m pytest -q     # 73 个单测：prom/SSE/compat/docker scope/launcher/
+                                     #   startup/token 账本(区间·分日·峰谷)/日志截断/DB 上限/MCP 形状
 ../.venv/bin/python tools/parity.py  # 31 个 launcher ⇄ run_llm.sh 对拍用例
 ../.venv/bin/python tools/shot.py http://127.0.0.1:9000/ /tmp/ui.png --height 3600   # 截图
+../.venv/bin/python tools/shot.py http://127.0.0.1:9000/ /tmp/ui.png \
+    --eval "document.querySelector('#tok-apply').click()"        # 截"点击之后"的界面
 node --check monitor/web/app.js      # 前端语法（无构建步骤）
 ```
 
@@ -334,20 +394,23 @@ monitor/
 ├── config.py      YAML + env 覆盖，路径解析
 ├── prom.py        Prometheus 文本解析 + 直方图分位
 ├── nvml.py        NVML(ctypes) + nvidia-smi 兜底
-├── engine.py      vLLM / NInfer → 统一指标字典
+├── engine.py      vLLM / NInfer → 统一指标字典（10s + 60s 两个速率窗口）
 ├── tap.py         逐请求记录 + 三种协议的 SSE 解析
 ├── gateway.py     零缓冲透传代理（含 /v1/completions 兼容）
 ├── compat.py      legacy completions ⇄ chat 翻译
-├── store.py       ring buffer + SQLite（保留最近 200 条原文）
+├── store.py       ring buffer + SQLite（请求历史 / token 账本 / 电量）
+├── billing.py     token → 元（DeepSeek 峰谷价目）＋ GPU 电费
+├── maintenance.py 日志原地截断 + DB 硬上限（磁盘边界）
 ├── controller.py  run_llm.sh 编排 + 状态机 + 契约探针
 ├── api.py         REST / WS / 静态页 / Prometheus 导出
 ├── app.py         两个 uvicorn + 采集循环
 ├── docker_scope.py  docker 作用域（白名单 verb + 逐对象校验）
 ├── launcher.py    engines/*.yaml -> LaunchPlan（run_llm.sh 的替代品）
 ├── engines/       vllm.yaml · ninfer.yaml（profiles/mounts/env/preflight）
-├── mcp_server.py  MCP（stdio / http）
-└── tools/shot.py  本地截图（CDP，无 npm 依赖）
+├── mcp_server.py  MCP（stdio / http），工具文档见 MCP.md
 └── web/           index.html · style.css · app.js · vendor/uPlot
+
+tests/             pytest；tools/  parity.py（launcher 对拍）· bench.py · shot.py（CDP 截图）
 ```
 
 ## FAQ
@@ -373,4 +436,23 @@ vLLM 冷启动要重新加载权重/编译 kernel，几分钟；NInfer 大约 10
 
 **数据存在哪？**
 `state/monitor.db`（SQLite，WAL）。原文只留最近 200 条，30 天后自动清元数据；
-`DELETE /api/requests?keep=0` 可清空。
+`DELETE /api/requests?keep=0` 可清空。电量在 `gpu_energy` 表里，一天一行，不会长大。
+
+**会不会把磁盘写满？**
+不会。四类会自己长大的东西都有上限（`maintenance.py`，每 30 s 检查一次）：
+
+| 文件 | 上限 | 行为 |
+|---|---|---|
+| `run/<engine>.log`（引擎 stdout） | `logs.max_log_mb` (64) | 超过就只留尾部 `keep_tail_mb` (8)，**原地截断**，不动 inode |
+| `run/monitor.log`（monitor 自己的 stdout） | 同上 | 同上 |
+| `run/ninfer-requests.jsonl` | `logs.jsonl_max_mb` (64) | 同上（NInfer 用 `ios::app`，截断安全） |
+| `state/lifecycle.log` | `logs.lifecycle_max_mb` (8) | 同上 |
+| `state/monitor.db` | `storage.retention_days` (30) + `storage.max_db_mb` (512) | 先按时间删，超过硬上限再删最老的 10% 直到达标，用 `incremental_vacuum` 还页（不需要 2 倍空间的 VACUUM） |
+
+日志是**原地截断**而不是 rename 轮转：引擎进程持有 O_APPEND 的 fd，rename 之后它会继续
+往一个已删除的 inode 里写，磁盘不释放、日志也看不到。
+
+只有 Docker 容器日志不归我们管（文件在 `/var/lib/docker`），如果 vLLM 跑很久，给容器加
+`--log-opt max-size=64m --log-opt max-file=2`（或在 `/etc/docker/daemon.json` 里设
+`log-opts`）。注意这行会改变 `engines/vllm.yaml` 的 argv，`tools/parity.py` 与
+`run_llm.sh --dry-run` 的逐字节对比需要同步更新。

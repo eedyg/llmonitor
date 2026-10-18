@@ -7,6 +7,7 @@ import time
 from collections import deque
 from typing import Any
 
+from .billing import snapshot_report
 from .config import Config
 from .docker_scope import Docker, Scope
 from .engine import EngineStore
@@ -26,6 +27,7 @@ class Runtime:
             text_keep=storage.text_keep,
             text_cap=storage.text_cap_bytes,
             retention_days=storage.retention_days,
+            peak_hours=tuple(cfg.root.billing.deepseek.peak_hours or ()),
         )
         self.gpu = GpuCollector(
             interval_s=float(cfg.root.collect.gpu_interval_s),
@@ -92,6 +94,7 @@ class Runtime:
     # -- snapshot -----------------------------------------------------------
     def snapshot(self) -> dict:
         controller = self.controller.info() if self.controller else {"state": "unknown"}
+        tokens = self.store.token_totals(cache_ratio=self.engine.cache_hit_ratio())
         return {
             "type": "snapshot",
             "ts": time.time(),
@@ -102,6 +105,8 @@ class Runtime:
             "gpu": self.gpu.info(),
             "live": self.taps.snapshot(),
             "summary": self.store.summary(),
+            "tokens": tokens,
+            "billing": snapshot_report(self.cfg.root.billing, tokens, self.store.energy_totals()),
             "gateway": dict(self.gateway),
             "point": self.make_point(),
             "events": list(self.events)[-12:],

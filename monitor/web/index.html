@@ -47,12 +47,12 @@
     <section class="kpis" id="kpis">
       <div class="card kpi">
         <div class="kpi-top"><span>Decode 速度</span><canvas class="spark" data-key="decode_tps"></canvas></div>
-        <div class="kpi-value"><b id="k-decode">—</b><small>tok/s</small></div>
+        <div class="kpi-value"><b id="k-decode">—</b><small>tok/s</small><span class="kpi-alt" title="最近 1 分钟平均 decode 速度"><b id="k-decode-1m">—</b><small>1min 均值</small></span></div>
         <div class="kpi-sub" id="k-decode-sub">—</div>
       </div>
       <div class="card kpi">
         <div class="kpi-top"><span>Prefill 速度</span><canvas class="spark" data-key="prefill_tps"></canvas></div>
-        <div class="kpi-value"><b id="k-prefill">—</b><small>tok/s</small></div>
+        <div class="kpi-value"><b id="k-prefill">—</b><small>tok/s</small><span class="kpi-alt" title="最近 1 分钟平均 prefill 速度"><b id="k-prefill-1m">—</b><small>1min 均值</small></span></div>
         <div class="kpi-sub" id="k-prefill-sub">—</div>
       </div>
       <div class="card kpi">
@@ -103,6 +103,65 @@
       <div class="card chart-card">
         <div class="card-head"><h2>功耗与温度</h2><span class="hint">W / °C</span></div>
         <div class="chart" id="chart-power"></div>
+      </div>
+    </section>
+
+    <section class="card token-card" id="token-card">
+      <div class="card-head">
+        <h2>Token 累计</h2>
+        <span class="hint" id="tok-hint">—</span>
+        <div class="tok-controls">
+          <input type="date" id="tok-from" aria-label="开始日期" />
+          <span class="tok-dash">→</span>
+          <input type="date" id="tok-to" aria-label="结束日期" />
+          <button class="btn small" id="tok-apply" title="汇总所选日期区间（含首尾两天）">查区间</button>
+          <button class="btn small" id="tok-reset" title="清除区间，回到库内全部累计">全部</button>
+        </div>
+      </div>
+      <div class="tok-row">
+        <div class="tok-main">
+          <span class="tok-label">总 Token（in + out）</span>
+          <div class="tok-value"><b id="tok-total">—</b><small>tok</small></div>
+          <div class="tok-sub" id="tok-total-sub">—</div>
+        </div>
+        <div class="tok-split">
+          <div class="tok-head"><span class="tok-label">Prompt in</span><b id="tok-prompt">—</b></div>
+          <div class="tok-bar">
+            <i class="seg-hit" id="tok-in-hit-bar"></i>
+            <i class="seg-miss" id="tok-in-miss-bar"></i>
+          </div>
+          <div class="tok-legend">
+            <span><i class="tok-dot hit"></i>缓存命中 <b id="tok-in-hit">—</b><em id="tok-in-hit-pct"></em></span>
+            <span><i class="tok-dot miss"></i>未命中 <b id="tok-in-miss">—</b><em id="tok-in-miss-pct"></em></span>
+          </div>
+        </div>
+        <div class="tok-split">
+          <div class="tok-head"><span class="tok-label">Output</span><b id="tok-output">—</b></div>
+          <div class="tok-bar">
+            <i class="seg-think" id="tok-out-think-bar"></i>
+            <i class="seg-content" id="tok-out-content-bar"></i>
+          </div>
+          <div class="tok-legend">
+            <span><i class="tok-dot think"></i>Thinking <b id="tok-thinking">—</b><em id="tok-thinking-pct"></em></span>
+            <span><i class="tok-dot content"></i>真实输出 <b id="tok-content">—</b><em id="tok-content-pct"></em></span>
+          </div>
+        </div>
+      </div>
+      <div class="tok-money">
+        <span class="money-item">
+          <span class="tok-label" id="tok-cost-ds-label">DeepSeek 等价费用</span>
+          <b id="tok-cost-ds">—</b><small>元</small>
+          <em id="tok-cost-ds-sub">—</em>
+        </span>
+        <span class="money-sep"></span>
+        <span class="money-item">
+          <span class="tok-label">GPU 电费</span>
+          <b id="tok-cost-power">—</b><small>元</small>
+          <em id="tok-cost-power-sub">—</em>
+        </span>
+      </div>
+      <div class="tok-days-wrap" id="tok-days-wrap" hidden>
+        <table class="tok-days" id="tok-days"></table>
       </div>
     </section>
 
