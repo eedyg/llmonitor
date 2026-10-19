@@ -110,8 +110,14 @@ class NvmlGpu:
 
         power_mw = self._uint("nvmlDeviceGetPowerUsage")
         info["power_w"] = round(power_mw / 1000.0, 1) if power_mw is not None else None
-        limit_mw = self._uint("nvmlDeviceGetEnforcedPowerLimit")
-        info["power_limit_w"] = round(limit_mw / 1000.0, 1) if limit_mw is not None else None
+        # power_limit_w = the configured setpoint (what the operator set with -pl);
+        # power_enforced_w = what the hardware is enforcing right now, which NVML
+        # only refreshes on its own power-monitoring cycle (can lag for seconds).
+        setpoint_mw = self._uint("nvmlDeviceGetPowerManagementLimit")
+        info["power_limit_w"] = round(setpoint_mw / 1000.0, 1) if setpoint_mw is not None else None
+        enforced_mw = self._uint("nvmlDeviceGetEnforcedPowerLimit")
+        info["power_enforced_w"] = (round(enforced_mw / 1000.0, 1)
+                                    if enforced_mw is not None else None)
 
         info["fan_pct"] = self._uint("nvmlDeviceGetFanSpeed")
         info["sm_clock_mhz"] = self._uint("nvmlDeviceGetClockInfo", ctypes.c_uint(0))

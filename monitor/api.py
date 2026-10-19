@@ -13,7 +13,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request, WebSocket, WebSo
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import billing, launcher
+from . import billing, gpu_ctl, launcher
 from .docker_scope import DockerError, ResourceInUse, ScopeViolation
 from .runtime import Runtime
 from .store import day_window
@@ -162,6 +162,19 @@ def build_api(rt: Runtime) -> FastAPI:
         return {"engines": data, "default": rt.cfg.root.engine.default,
                 "gateway_port": rt.controller.gateway_port,
                 "engine_port": rt.controller.engine_port}
+
+    @app.get("/api/gpu/power")
+    async def gpu_power() -> dict:
+        """当前功耗上限 + 驱动允许范围 + 开机将恢复的值。"""
+        return await asyncio.to_thread(gpu_ctl.query_limits)
+
+    @app.post("/api/gpu/power")
+    async def gpu_power_set(payload: dict) -> dict:
+        """调整功耗上限（立即生效并持久化，重启/驱动重载后仍生效）。"""
+        result = await asyncio.to_thread(gpu_ctl.apply_power_limit, payload.get("watts"))
+        rt.publish({"type": "gpu_power", "ok": bool(result.get("ok")),
+                    "watts": result.get("applied_w"), "error": result.get("error")})
+        return result
 
     @app.get("/api/kvcache")
     async def kvcache() -> dict:

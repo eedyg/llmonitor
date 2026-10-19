@@ -172,6 +172,14 @@
     <section class="card gpu-card">
       <div class="card-head"><h2>GPU</h2><span class="hint" id="info-gpu-mode">—</span></div>
       <dl class="kv gpu-kv" id="gpu-info"></dl>
+      <div class="gpu-power" id="gpu-power">
+        <span class="gpu-power-label">功耗上限</span>
+        <input id="gpu-power-input" type="number" step="5" inputmode="numeric"
+               aria-label="GPU 功耗上限（W）">
+        <span class="gpu-power-unit">W</span>
+        <button class="btn small" id="gpu-power-apply">应用</button>
+        <small class="gpu-power-hint" id="gpu-power-hint">—</small>
+      </div>
       <div class="procs" id="gpu-procs"></div>
     </section>
 

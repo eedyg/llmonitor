@@ -844,6 +844,11 @@
       dl.append(el("dt", null, k));
       dl.append(el("dd", null, v));
     }
+    // 功耗上限：值来自实时快照，范围/持久化值来自 /api/gpu/power
+    const powerInput = $("#gpu-power-input");
+    if (powerInput && document.activeElement !== powerInput && powerInput.dataset.dirty !== "1") {
+      powerInput.value = gpu.power_limit_w ? String(Math.round(gpu.power_limit_w)) : "";
+    }
     const procs = $("#gpu-procs");
     procs.replaceChildren();
     for (const proc of gpu.procs || []) {
@@ -983,6 +988,55 @@
     for (const [k, v] of info) {
       dl.append(el("dt", null, k));
       dl.append(el("dd", null, v));
+    }
+  }
+
+  async function loadGpuPower() {
+    try {
+      const d = await api("/api/gpu/power");
+      state.gpuPower = d;
+      const input = $("#gpu-power-input");
+      if (input && d.ok) {
+        input.min = String(Math.round(d.min_w));
+        input.max = String(Math.round(d.max_w));
+      }
+      const hint = $("#gpu-power-hint");
+      if (hint) {
+        hint.textContent = d.ok
+          ? `范围 ${fmt(d.min_w, 0)}–${fmt(d.max_w, 0)} W · 默认 ${fmt(d.default_w, 0)} W`
+            + (d.persisted_w ? ` · 开机恢复 ${fmt(d.persisted_w, 0)} W` : "")
+          : `不可用：${d.error || "nvidia-smi 读取失败"}`;
+      }
+    } catch (err) {
+      const hint = $("#gpu-power-hint");
+      if (hint) hint.textContent = `读取失败：${err.message || err}`;
+    }
+  }
+
+  async function applyGpuPower() {
+    const input = $("#gpu-power-input");
+    const hint = $("#gpu-power-hint");
+    const watts = Number(input.value);
+    if (!watts) {
+      if (hint) hint.textContent = "请输入目标瓦数";
+      return;
+    }
+    input.disabled = true;
+    if (hint) hint.textContent = `正在设置 ${watts} W…`;
+    try {
+      const res = await post("/api/gpu/power", { watts });
+      if (res.ok) {
+        toast("功耗上限已更新", `${fmt(res.applied_w, 0)} W（请求 ${fmt(res.requested_w, 0)} W）`,
+              "ok");
+        input.dataset.dirty = "0";
+      } else {
+        toast("设置失败", res.error || "未知错误", "bad");
+      }
+      await loadGpuPower();
+    } catch (err) {
+      if (hint) hint.textContent = `失败：${err.message || err}`;
+    } finally {
+      input.disabled = false;
     }
   }
 
@@ -1741,6 +1795,17 @@
         previewCommand();
       });
     }
+    const powerApply = $("#gpu-power-apply");
+    if (powerApply) {
+      powerApply.addEventListener("click", applyGpuPower);
+      const input = $("#gpu-power-input");
+      input.addEventListener("input", () => { input.dataset.dirty = "1"; });
+      input.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") { ev.preventDefault(); applyGpuPower(); }
+      });
+      loadGpuPower();
+    }
+
     $("#profile").addEventListener("change", () => {
       state.profileTouched = true;
       renderEngineOptions();
