@@ -287,3 +287,37 @@ def test_apply_launch_can_disable_offload(tmp_path):
     mon = make_monitor(tmp_path)
     mon.apply_launch({"offload_enabled": "0"})
     assert mon.view()["enabled"] is False
+
+
+def test_reserve_scales_with_capacity(tmp_path):
+    mon = make_monitor(tmp_path)
+    gib = 1024 ** 3
+    # 98 GiB -> 5 % (4.9 GiB) because that beats the 2 GiB floor
+    assert mon._reserve(98 * gib) == int(98 * gib * 0.05)
+    # 10 GiB -> the 2 GiB floor wins
+    assert mon._reserve(10 * gib) == 2 * gib
+    # degenerate small fs is clamped to half so "use all" never becomes "use none"
+    assert mon._reserve(1000) == 500
+    assert mon._reserve(0) == 0
+
+
+def test_unlimited_cap_still_keeps_a_reserve(tmp_path, monkeypatch):
+    """disk_limit_gb=0 must not mean "fill the partition" — that caused ENOSPC."""
+    gib = 1024 ** 3
+    monkeypatch.setattr(kvcache, "filesystem_usage", lambda _p: (98 * gib, 40 * gib))
+    mon = make_monitor(tmp_path, disk_limit_bytes=0)
+    mon.collect_disk(now=1.0, reclaim=False)
+    disk = mon.view()["disk"]
+    assert disk["limit_bytes"] == 0                      # config: unlimited
+    assert disk["reserve_bytes"] == int(98 * gib * 0.05)
+    assert disk["effective_limit_bytes"] == 98 * gib - disk["reserve_bytes"]
+    assert disk["capacity_bytes"] == 98 * gib
+    assert disk["near_full"] is False
+
+
+def test_near_full_flags_a_disk_about_to_run_out(tmp_path, monkeypatch):
+    gib = 1024 ** 3
+    monkeypatch.setattr(kvcache, "filesystem_usage", lambda _p: (98 * gib, gib // 2))
+    mon = make_monitor(tmp_path, disk_limit_bytes=0)
+    mon.collect_disk(now=1.0, reclaim=False)
+    assert mon.view()["disk"]["near_full"] is True

@@ -58,6 +58,12 @@ BP_DROPPED_BLOCKS = "vllm:kv_offload_tiering_backpressure_blocks_dropped"
 
 SHM_GLOB = "vllm_offload_*.mmap"
 
+# Keep this much of the cache filesystem free. vLLM's fs tier cannot cope with a
+# full disk (every store fails with ENOSPC), so "use all" is capped at capacity
+# minus this reserve.
+RESERVE_RATIO = 0.05
+MIN_RESERVE_BYTES = 2 * 1024 ** 3
+
 EMPTY: dict[str, Any] = {
     "enabled": False,
     "dir": "",
@@ -65,7 +71,9 @@ EMPTY: dict[str, Any] = {
     "gpu": {"pct": None, "blocks": None, "block_size": None},
     "cpu": {"budget_bytes": 0, "active_pct": None, "write_pct": None,
             "region_bytes": 0, "region_used_bytes": 0, "stores_skipped": 0},
-    "disk": {"used_bytes": 0, "capacity_bytes": 0, "limit_bytes": 0, "files": 0,
+    "disk": {"used_bytes": 0, "capacity_bytes": 0, "limit_bytes": 0,
+             "effective_limit_bytes": 0, "free_bytes": 0, "reserve_bytes": 0,
+             "near_full": False, "files": 0,
              "read_bps": None, "write_bps": None, "read_time_s": 0.0,
              "write_time_s": 0.0, "queries": 0, "hits": 0, "hit_rate": None,
              "promo_fail": 0, "cascade_fail": 0,
@@ -387,19 +395,38 @@ class KvCacheMonitor:
         snap["collected_at"] = now
 
     # -- host side -----------------------------------------------------------
+    def _reserve(self, capacity: int) -> int:
+        """Head-room kept free on the filesystem, even when the cap is "use all".
+
+        vLLM's fs tier is not capacity-aware: it keeps writing until the syscall
+        fails, and every failure surfaces as a cascade-job error (measured: 2102
+        ENOSPC failures filled the partition and pushed a 150k prefill from ~65 s
+        to 268 s). So "unlimited" must still mean "stop before the disk is full".
+        """
+        if capacity <= 0:
+            return 0
+        # never reserve more than half the filesystem (tiny tmpfs in tests)
+        return min(max(MIN_RESERVE_BYTES, int(capacity * RESERVE_RATIO)), capacity // 2)
+
     def collect_disk(self, now: float, reclaim: bool = True) -> None:
         snap = self.snapshot
         used, files = dir_usage(self.directory) if self.directory.exists() else (0, 0)
-        capacity, _free = filesystem_usage(self.directory)
+        capacity, free = filesystem_usage(self.directory)
+        reserve = self._reserve(capacity)
+        # explicit cap wins; "0 = use all" becomes "all but the reserve"
+        effective = int(self.disk_limit_bytes) if self.disk_limit_bytes > 0 else max(capacity - reserve, 0)
         snap["disk"]["used_bytes"] = used
         snap["disk"]["files"] = files
-        snap["disk"]["capacity_bytes"] = (
-            int(self.disk_limit_bytes) if self.disk_limit_bytes > 0 else capacity
-        )
+        snap["disk"]["capacity_bytes"] = capacity
+        snap["disk"]["limit_bytes"] = int(self.disk_limit_bytes)
+        snap["disk"]["reserve_bytes"] = reserve
+        snap["disk"]["free_bytes"] = free
+        snap["disk"]["effective_limit_bytes"] = effective
+        snap["disk"]["near_full"] = bool(free and free < reserve)
         snap["cpu"]["region_bytes"] = self._shm_bytes()
         snap["cpu"]["region_used_bytes"] = self._shm_allocated()
-        if reclaim and self.disk_limit_bytes > 0 and used > self.disk_limit_bytes:
-            result = self.reclaim(now)
+        if reclaim and effective > 0 and used > effective:
+            result = self.reclaim(now, limit_bytes=effective)
             snap["disk"]["used_bytes"] = result["bytes"]
             snap["disk"]["files"] = result["files"]
         snap["ts"] = now
@@ -442,7 +469,8 @@ class KvCacheMonitor:
             return 0
         return total
 
-    def reclaim(self, now: float, target_ratio: float = 0.9) -> dict:
+    def reclaim(self, now: float, target_ratio: float = 0.9,
+                limit_bytes: int | None = None) -> dict:
         """Delete the oldest block files until usage is back under the limit.
 
         The files are created by the engine (root inside the container) while the
@@ -451,7 +479,8 @@ class KvCacheMonitor:
         is unavailable too the error is recorded and surfaced in the UI instead
         of silently doing nothing.
         """
-        target = int(self.disk_limit_bytes * target_ratio)
+        limit = int(limit_bytes if limit_bytes is not None else self.disk_limit_bytes)
+        target = int(limit * target_ratio)
         used, files = dir_usage(self.directory)
         victims: list[tuple[str, int]] = []
         projected = used

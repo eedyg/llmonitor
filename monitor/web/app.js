@@ -905,8 +905,11 @@
       if (bps >= 1024 ** 2) return `${fmt(bps / 1024 ** 2, 1)} MiB/s`;
       return `${fmt(bps / 1024, 0)} KiB/s`;
     };
-    const diskPct = disk.capacity_bytes
-      ? (Number(disk.used_bytes || 0) / Number(disk.capacity_bytes)) * 100
+    // 用「生效上限」（= capacity − 保留区）而不是整个分区：limit=0 时 vLLM 会一直
+    // 写到 ENOSPC（实测 2102 次写失败、prefill 慢 4 倍），见 kvcache.py 的保留区注释。
+    const diskLimit = Number(disk.effective_limit_bytes || disk.capacity_bytes || 0);
+    const diskPct = diskLimit
+      ? (Number(disk.used_bytes || 0) / diskLimit) * 100
       : null;
     const rows = [
       {
@@ -930,9 +933,14 @@
       {
         name: "磁盘",
         pct: diskPct,
-        text: `${gib(disk.used_bytes)} / ${gib(disk.capacity_bytes)}`,
-        color: "var(--violet)",
-        title: disk.limit_bytes ? "受 kvcache.disk_limit_gb 限制" : "用满所在分区",
+        text: `${gib(disk.used_bytes)} / ${gib(diskLimit)}`
+          + ` · 剩 ${gib(disk.free_bytes)}`
+          + (disk.limit_bytes ? `（上限 ${gib(disk.limit_bytes)}）`
+                              : `（自动保留 ${gib(disk.reserve_bytes)}）`),
+        color: disk.near_full ? "var(--bad)" : "var(--violet)",
+        title: disk.limit_bytes
+          ? "受 kvcache.disk_limit_gb 限制"
+          : "limit=0 → 用满分区但留出保留区，避免 vLLM 写到 ENOSPC",
       },
     ];
     for (const row of rows) {
@@ -953,9 +961,14 @@
       ["磁盘命中", (disk.hit_rate === null || disk.hit_rate === undefined)
         ? "—"
         : `${fmt(disk.hit_rate * 100, 1)} %（${fmtInt(disk.hits)}/${fmtInt(disk.queries)} 块）`],
-      ["磁盘文件", `${fmtInt(disk.files)} 个${disk.limit_bytes ? ` · 上限 ${gib(disk.limit_bytes)}` : " · 不限"}`],
+      ["磁盘文件", `${fmtInt(disk.files)} 个 · 生效上限 ${gib(diskLimit)}`
+        + (disk.limit_bytes ? "" : `（自动，保留 ${gib(disk.reserve_bytes)}）`)],
       ["失败/丢弃", `升级失败 ${fmtInt(disk.promo_fail)} · 背压丢弃 ${fmtInt(disk.dropped_stores)}`],
     ];
+    if (disk.near_full) {
+      info.unshift(["⚠️ 磁盘将满", `剩余 ${gib(disk.free_bytes)} < 保留区 `
+        + `${gib(disk.reserve_bytes)}：offload 写入即将失败（ENOSPC）`]);
+    }
     const health = kv.health || {};
     info.push(["磁盘健康", health.error
       ? `不可用：${health.error}`
