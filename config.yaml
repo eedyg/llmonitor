@@ -82,14 +82,12 @@ kvcache:
   enabled: true                 # 总开关；也决定引擎启动时是否带 offload 参数
   cpu_bytes_to_use: "12G"       # 第 2 级（CPU 主层）预算；12G = 12 GiB
   disk_dir: "/mnt/kvcache/kvoffload"   # 第 3 级磁盘层根目录（宿主机路径）
-  # 磁盘层上限（GiB）。默认 64：
-  #   - 约占 98 GiB 分区的 2/3，留 ~34 GiB 余量，杜绝 ENOSPC（写满曾让 150k
-  #     prefill 从 65s 劣化到 268s，见 4a170e3）
-  #   - 约等于 12 个 128k 前缀（每个 ≈5.2 GB KV），或 ~24 个 64k 前缀
-  #   - 回收在 90% 水位触发，稳态占用 ≈57.6 GiB
-  # 0 = 不设上限，但仍会自动保留 capacity×5%（≥2 GiB）；
-  # 显式值也不会超过「分区容量 − 保留区」，避免手滑写大。
-  disk_limit_gb: 64
+  # 磁盘层上限（GiB）。0 = 用满所在分区但自动保留 capacity×5%（≥2 GiB）。
+  # 卷布局（vg_ssd1，870 GiB）：docker 350 / models 340 / kvcache 180。
+  #   - kvcache 文件系统 177 GiB，保留区 ≈8.8 GiB → 可用 ≈168 GiB
+  #   - 保留区是硬性保护：写满曾导致 2102 次 ENOSPC、150k prefill 从 65s 劣化到 268s
+  # 显式值会被「分区容量 − 保留区」钳制，所以写 200 也不会突破安全线。
+  disk_limit_gb: 0
   eviction_policy: "arc"        # CPU 主层驱逐策略：lru / arc
   # 容量与 IO 采集频率（低频即可，磁盘遍历有成本）
   collect_interval_s: 30
