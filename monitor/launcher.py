@@ -432,8 +432,9 @@ def resolve(
                 )
             else:
                 warnings.append(
-                    f"Context {ctx} on vLLM is KV-tight at {kv_cache_dtype} KV: measured 366,097 KV "
-                    "tokens = 1.40x concurrency for this window. Long concurrent requests will queue."
+                    f"Context {ctx} on vLLM is KV-tight at {kv_cache_dtype} KV: measured 295,827 KV "
+                    "tokens = 1.13x concurrency for a full-window request (2x 128k still fits). "
+                    "Long concurrent requests will queue; lower ctx to raise concurrency."
                 )
         if profile == "dflash":
             draft = Path(str(variables["models_dir"])) / str(variables["dflash_dir_name"]) / "config.json"

@@ -280,7 +280,7 @@ class Controller:
             if merged.get(key) in (None, ""):
                 merged[key] = value
         if not merged.get("ctx"):
-            merged["ctx"] = dict(self.cfg.root.engine.default_ctx).get(engine, "128k")
+            merged["ctx"] = dict(self.cfg.root.engine.default_ctx).get(engine, "128k")  # fallback only
         if engine == "ninfer" and bool(self.cfg.root.engine.ninfer_jsonl):
             extra = [str(a) for a in (merged.get("extra_args") or [])]
             jsonl_path = self.run_dir / Path(str(self.cfg.root.engine.ninfer_jsonl_path)).name

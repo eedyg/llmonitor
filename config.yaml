@@ -36,8 +36,11 @@ engine:
     vllm: "vllm-qwen38"
     ninfer: "ninfer-qwen38"
   profiles: ["stage1", "mtp", "dflash", "dflash2", "kv2", "kv3"]
+  # 启动时默认上下文（不指定 ctx 时用）。vllm 256k = 262,144 tok = 模型硬上限
+  # (max_position_embeddings)。注意：GPU KV 池约 272,954 tok，256k 时并发只有
+  # ~1.04x —— 长上下文与并发不可兼得，需要并发请在引擎页把 ctx 调小。
   default_ctx:
-    vllm: "128k"
+    vllm: "256k"
     ninfer: "256k"
   stop_grace_s: 25
   health_timeout_s: 1800
