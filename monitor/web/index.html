@@ -101,6 +101,10 @@
         <div class="chart" id="chart-cache"></div>
       </div>
       <div class="card chart-card">
+        <div class="card-head"><h2>KV offload</h2><span class="hint">% · MiB/s</span></div>
+        <div class="chart" id="chart-kvoffload"></div>
+      </div>
+      <div class="card chart-card">
         <div class="card-head"><h2>功耗与温度</h2><span class="hint">W / °C</span></div>
         <div class="chart" id="chart-power"></div>
       </div>
@@ -169,6 +173,15 @@
       <div class="card-head"><h2>GPU</h2><span class="hint" id="info-gpu-mode">—</span></div>
       <dl class="kv gpu-kv" id="gpu-info"></dl>
       <div class="procs" id="gpu-procs"></div>
+    </section>
+
+    <section class="card kvcache-card" id="kvcache-card">
+      <div class="card-head">
+        <h2>KV 三级缓存</h2>
+        <span class="hint" id="kv-tier-hint">GPU → 内存 → 磁盘</span>
+      </div>
+      <div class="kv-tiers" id="kv-tiers"></div>
+      <dl class="kv" id="kv-tier-info"></dl>
     </section>
   </section>
 
@@ -249,7 +262,7 @@
 
         <label class="field">
           <span>Profile</span>
-          <select id="profile"><option value="stage1">stage1</option></select>
+          <select id="profile"></select>
         </label>
 
         <label class="field">

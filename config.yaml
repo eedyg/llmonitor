@@ -25,6 +25,10 @@ server:
 
 engine:
   default: "vllm"
+  # 启动时默认 profile（UI 预选 + 不指定 profile 时使用）。
+  default_profile:
+    vllm: "mtp"
+    ninfer: "stage1"
   # Where the engine binds. Loopback keeps every request on the data path
   # (nobody can bypass the tap). Set 0.0.0.0 only as an operational escape hatch.
   bind_host: "127.0.0.1"
@@ -66,6 +70,27 @@ collect:
   runtime_interval_s: 3.0
   # Window used to turn engine counters into tok/s.
   rate_window_s: 10.0
+
+# ---------------------------------------------------------------------------
+# KV cache 三级 offload（GPU 显存 → CPU 内存 → 磁盘）
+#
+# monitor 在启动 vLLM 时把这里的值转成 --kv-transfer-config，作为与 profile
+# 正交的一层追加，因此 mtp / dflash 等 profile 都能叠加。enabled=false 时
+# 引擎回到纯显存 KV（与旧行为一致）。
+# ---------------------------------------------------------------------------
+kvcache:
+  enabled: true                 # 总开关；也决定引擎启动时是否带 offload 参数
+  cpu_bytes_to_use: "12G"       # 第 2 级（CPU 主层）预算；12G = 12 GiB
+  disk_dir: "/mnt/kvcache/kvoffload"   # 第 3 级磁盘层根目录（宿主机路径）
+  # 0 = 用满 disk_dir 所在分区（默认）；>0 时由 monitor 回收最旧的块文件。
+  # 注意：vLLM 的 fs tier 本身没有任何容量上限，所以只能在这里兜底。
+  disk_limit_gb: 0
+  eviction_policy: "arc"        # CPU 主层驱逐策略：lru / arc
+  # 容量与 IO 采集频率（低频即可，磁盘遍历有成本）
+  collect_interval_s: 30
+  # NVMe SMART 健康采集频率（低频）
+  health_interval_s: 120
+  device: ""                    # 健康检查设备；空 = 自动探测 disk_dir 所在物理盘
 
 storage:
   db: "./state/monitor.db"

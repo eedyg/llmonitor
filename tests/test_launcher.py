@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from monitor import launcher
@@ -118,9 +120,60 @@ def test_kv3_multiline_json_is_one_argument():
     idx = plan.engine_argv.index("--kv-transfer-config")
     blob = plan.engine_argv[idx + 1]
     assert blob.startswith('{"kv_connector":"OffloadingConnector"')
-    assert blob.count("\n") == 6
-    assert "/kvoffload/Qwen3.8-27B-FP8" in blob
+    # Multiline JSON must survive as exactly one argument, and must stay valid.
+    parsed = json.loads(blob)
+    assert parsed["kv_connector"] == "OffloadingConnector"
+    extra = parsed["kv_connector_extra_config"]
+    assert extra["spec_name"] == "TieringOffloadingSpec"
+    tier = extra["secondary_tiers"][0]
+    assert tier["type"] == "fs"
+    assert tier["root_dir"] == "/kvoffload/Qwen3.8-27B-FP8"
+    # vLLM 0.31 contract: backpressure_cls is a *detector*, policy_cls the policy.
+    assert tier["backpressure"]["backpressure_cls"] == "EMABackpressureDetector"
+    assert tier["backpressure"]["policy_cls"] == "DropStorePolicy"
     assert "/home/eedy/kvoffload:/kvoffload" in plan.mounts
+
+
+def test_offload_layer_is_orthogonal_to_profile():
+    """config.yaml → kvcache.enabled drives a layer that any profile can carry."""
+    plan = resolve(profile="mtp", offload_enabled="1", cpu_bytes_to_use="12G")
+    idx = plan.engine_argv.index("--kv-transfer-config")
+    parsed = json.loads(plan.engine_argv[idx + 1])
+    assert parsed["kv_connector_extra_config"]["cpu_bytes_to_use"] == 12884901888
+    # mtp keeps its speculative args and gains the offload layer.
+    assert "--speculative-config" in plan.engine_argv
+    assert "/home/eedy/kvoffload:/kvoffload" in plan.mounts
+    # The layer must come after the profile args, not before.
+    assert idx > plan.engine_argv.index("--speculative-config")
+
+
+def test_offload_disabled_by_default():
+    plan = resolve(profile="mtp")
+    assert "--kv-transfer-config" not in plan.engine_argv
+    assert not any("kvoffload" in mount for mount in plan.mounts)
+
+
+def test_offload_layer_skipped_for_legacy_profiles():
+    """kv2/kv3 carry their own offload args; the layer must not double them up."""
+    plan = resolve(profile="kv3", offload_enabled="1")
+    assert plan.engine_argv.count("--kv-transfer-config") == 1
+    # exactly one mount, not one from the profile plus one from the layer
+    assert plan.mounts.count("/home/eedy/kvoffload:/kvoffload") == 1
+    assert plan.argv.count("/home/eedy/kvoffload:/kvoffload") == 1
+
+
+def test_size_vars_are_normalized():
+    plan = resolve(profile="mtp", offload_enabled="1", cpu_bytes_to_use="8192m")
+    idx = plan.engine_argv.index("--kv-transfer-config")
+    parsed = json.loads(plan.engine_argv[idx + 1])
+    assert parsed["kv_connector_extra_config"]["cpu_bytes_to_use"] == 8589934592
+
+
+def test_default_cpu_budget_is_12g():
+    plan = resolve(profile="kv3")
+    idx = plan.engine_argv.index("--kv-transfer-config")
+    parsed = json.loads(plan.engine_argv[idx + 1])
+    assert parsed["kv_connector_extra_config"]["cpu_bytes_to_use"] == 12884901888
 
 
 def test_env_overrides_still_work():

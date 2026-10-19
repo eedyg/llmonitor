@@ -71,7 +71,8 @@ EMPTY = {
     "cache": {"kv_pct": 0.0, "kv_used_pages": 0, "kv_capacity_pages": 0,
               "prefix_queries": 0, "prefix_hits": 0, "hit_rate": 0.0,
               "host_used_bytes": 0, "host_capacity_bytes": 0, "pools": []},
-    "speed": {"decode_tps": None, "prefill_tps": None, "ttft_p50_ms": None,
+    "speed": {"decode_tps": None, "prefill_tps": None, "prefill_live_tps": None,
+              "prefill_source": None, "ttft_p50_ms": None,
               "ttft_p90_ms": None, "ttft_p99_ms": None, "queue_p50_ms": None,
               "e2e_p50_ms": None, "e2e_p90_ms": None, "itl_p50_ms": None,
               "prefill_mean_ms": None, "decode_mean_ms": None,
@@ -183,6 +184,22 @@ class VllmAdapter(EngineAdapter):
         st.push_rate("prefill", local_compute if local_compute is not None else prompt, now)
         st.push_rate("prompt", prompt, now)
 
+        # vLLM only accounts prompt tokens when a request *finishes*: measured on
+        # a 120k prefill, prompt_tokens_by_source stayed flat for 46 s and then
+        # jumped by 120k at once. A rate built from it therefore reads 0 % for
+        # the entire prefill and then spikes — which looks like "prefill is idle".
+        # kv_cache_usage_perc *is* updated every step, so its growth is a usable
+        # live prefill rate: it climbs while a prompt is being filled and goes
+        # flat during decode (evictions make it fall; Rates clamps to 0).
+        kv_tokens_cap = _f(cfg_labels.get("kv_cache_size_tokens"))
+        kv_pct_now = m.value("vllm:kv_cache_usage_perc") or 0.0
+        live_prefill = None
+        if kv_tokens_cap:
+            st.push_rate("kv_fill", kv_pct_now * kv_tokens_cap, now)
+            live_prefill = st.rates.rate("kv_fill", now)
+            if live_prefill is not None and live_prefill <= 1.0:
+                live_prefill = None
+
         queries = m.value("vllm:prefix_cache_queries_total") or 0.0
         hits = m.value("vllm:prefix_cache_hits_total") or 0.0
 
@@ -233,11 +250,20 @@ class VllmAdapter(EngineAdapter):
                 for s in m.samples("vllm:prompt_tokens_by_source_total")
             },
         }
+        accounted_prefill = st.rates.rate("prefill", now)
+        live_60 = st.rates_60.rate("kv_fill", now)
+        if live_60 is not None and live_60 <= 1.0:
+            live_60 = None
         snap["speed"] = {
             "decode_tps": _round(st.rates.rate("generation", now), 2),
             "decode_tps_60s": _round(st.rates_60.rate("generation", now), 2),
-            "prefill_tps": _round(st.rates.rate("prefill", now), 2),
-            "prefill_tps_60s": _round(st.rates_60.rate("prefill", now), 2),
+            # The live (KV-growth) figure wins while a prefill is in flight; the
+            # accounted counter only moves when the request completes, and that
+            # spike is still the better number during the moment it lands.
+            "prefill_tps": _round(live_prefill if live_prefill else accounted_prefill, 2),
+            "prefill_tps_60s": _round(live_60 if live_60 else st.rates_60.rate("prefill", now), 2),
+            "prefill_live_tps": _round(live_prefill, 2),
+            "prefill_source": "live" if live_prefill else "accounted",
             "ttft_p50_ms": _ms(m.quantile("vllm:time_to_first_token_seconds", 0.5)),
             "ttft_p90_ms": _ms(m.quantile("vllm:time_to_first_token_seconds", 0.9)),
             "ttft_p99_ms": _ms(m.quantile("vllm:time_to_first_token_seconds", 0.99)),

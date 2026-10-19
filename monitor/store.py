@@ -70,10 +70,21 @@ CREATE TABLE IF NOT EXISTS gpu_energy (
 CREATE TABLE IF NOT EXISTS cache_daily (
     day TEXT NOT NULL,             -- local calendar day, YYYY-MM-DD
     engine TEXT NOT NULL,
-    queries INTEGER NOT NULL DEFAULT 0,  -- prompt tokens processed
+    queries INTEGER NOT NULL DEFAULT 0,  -- prompt tokens processed (summed deltas)
     hits INTEGER NOT NULL DEFAULT 0,     -- of those, served from prefix cache
     updated REAL,
     PRIMARY KEY (day, engine)
+);
+-- Last counter value seen per engine. The engine's counters are cumulative
+-- since *its* start, so turning them into a day ledger requires the delta
+-- against this row rather than MAX(): a restart resets the engine counters,
+-- and MAX() of two independently-resetting counters mixes samples from
+-- different processes (which is how a 88% day turned into 0.4%).
+CREATE TABLE IF NOT EXISTS cache_state (
+    engine TEXT PRIMARY KEY,
+    queries INTEGER NOT NULL DEFAULT 0,
+    hits INTEGER NOT NULL DEFAULT 0,
+    updated REAL
 );
 """
 
@@ -599,13 +610,20 @@ class Store:
     # -- prompt cache hit ratio (persisted) ---------------------------------
     def record_cache(self, engine: str | None, queries: Any, hits: Any,
                      now: float | None = None) -> None:
-        """Persist the engine's cumulative prompt-cache counters, per local day.
+        """Accumulate the engine's prompt-cache counters as monotone deltas.
 
-        The counters live in the engine process and drop back to zero on every
-        restart, so reading them at render time made the *historical* cache-hit
-        estimate — and with it the DeepSeek equivalent cost — jump after a
-        reboot. We keep the largest value seen per day instead, which makes the
-        ratio monotone and restart-proof.
+        The counters are cumulative since the *engine process* started, and drop
+        to zero on every restart. Keeping the largest value per day (the previous
+        behaviour) mixed samples from different processes: the stored ``queries``
+        could come from a long benchmark run while ``hits`` still came from an
+        earlier, unrelated run, so the displayed "cumulative" hit rate collapsed
+        (an 88 % day became 0.4 %) even though nothing was actually wrong with
+        the cache.
+
+        Instead we persist the last value seen per engine in ``cache_state`` and
+        add the delta to today's row. A counter that moved backwards means the
+        engine restarted, so the new value is itself the delta. The state row is
+        persisted, so a monitor restart does not lose the baseline either.
         """
         try:
             q = int(queries or 0)
@@ -615,19 +633,39 @@ class Store:
         if q <= 0:
             return
         h = max(0, min(h, q))
+        stamp = now if now is not None else time.time()
+        key = engine or "?"
         with self._lock:
+            row = self.db.execute(
+                "SELECT queries, hits FROM cache_state WHERE engine = ?", (key,)
+            ).fetchone()
+            last_q, last_h = (int(row[0] or 0), int(row[1] or 0)) if row else (0, 0)
+            dq = q - last_q if q >= last_q else q
+            dh = h - last_h if h >= last_h else h
+            dq = max(0, dq)
+            dh = max(0, min(dh, dq))
+            if dq:
+                self.db.execute(
+                    "INSERT INTO cache_daily (day, engine, queries, hits, updated)"
+                    " VALUES (?,?,?,?,?)"
+                    " ON CONFLICT(day, engine) DO UPDATE SET"
+                    "   queries = queries + excluded.queries,"
+                    "   hits = hits + excluded.hits,"
+                    "   updated = excluded.updated",
+                    (date.today().isoformat(), key, dq, dh, stamp),
+                )
             self.db.execute(
-                "INSERT INTO cache_daily (day, engine, queries, hits, updated)"
-                " VALUES (?,?,?,?,?)"
-                " ON CONFLICT(day, engine) DO UPDATE SET"
-                "   queries = MAX(queries, excluded.queries),"
-                "   hits = MAX(hits, excluded.hits),"
+                "INSERT INTO cache_state (engine, queries, hits, updated)"
+                " VALUES (?,?,?,?)"
+                " ON CONFLICT(engine) DO UPDATE SET"
+                "   queries = excluded.queries,"
+                "   hits = excluded.hits,"
                 "   updated = excluded.updated",
-                (date.today().isoformat(), engine or "?", q, h,
-                 now if now is not None else time.time()),
+                (key, q, h, stamp),
             )
             self.db.commit()
-            self._tokens_cache = None
+            if dq:
+                self._tokens_cache = None
 
     def _cache_days(self) -> dict[str, tuple[float, float]]:
         """day -> (hits, queries) from the persisted counters (lock held)."""

@@ -25,6 +25,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "engine": {
         "default": "vllm",
+        "default_profile": {"vllm": "mtp", "ninfer": "stage1"},
         "bind_host": "127.0.0.1",
         "container_names": {"vllm": "vllm-qwen38", "ninfer": "ninfer-qwen38"},
         "profiles": ["stage1", "mtp", "dflash", "dflash2", "kv2", "kv3"],
@@ -84,6 +85,18 @@ DEFAULTS: dict[str, Any] = {
         },
     },
     "gpu": {"fallback_csv": True},
+    "kvcache": {
+        # 3-tier KV cache offload (GPU HBM → CPU RAM → disk), applied to any
+        # vLLM profile at launch time.
+        "enabled": True,
+        "cpu_bytes_to_use": "12G",
+        "disk_dir": "/mnt/kvcache/kvoffload",
+        "disk_limit_gb": 0,
+        "eviction_policy": "arc",
+        "collect_interval_s": 30.0,
+        "health_interval_s": 120.0,
+        "device": "",
+    },
     "docker": {
         "enabled": True,
         "image_repos": ["vllm/vllm-openai"],
@@ -154,6 +167,13 @@ _ENV_MAP = {
     "MONITOR_ENGINE_DEFAULT": ("engine", "default"),
     "MONITOR_DOCKER_PULL_TIMEOUT": ("docker", "pull_timeout_s"),
     "MONITOR_ENGINE_LAUNCHER": ("engine", "launcher"),
+    "MONITOR_KVCACHE_ENABLED": ("kvcache", "enabled"),
+    "MONITOR_KVCACHE_CPU": ("kvcache", "cpu_bytes_to_use"),
+    "MONITOR_KVCACHE_DIR": ("kvcache", "disk_dir"),
+    "MONITOR_KVCACHE_LIMIT_GB": ("kvcache", "disk_limit_gb"),
+    "MONITOR_KVCACHE_DEVICE": ("kvcache", "device"),
+    "MONITOR_KVCACHE_INTERVAL": ("kvcache", "collect_interval_s"),
+    "MONITOR_KVCACHE_HEALTH_INTERVAL": ("kvcache", "health_interval_s"),
 }
 
 

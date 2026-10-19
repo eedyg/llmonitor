@@ -18,6 +18,7 @@
     total: 0,
     connected: false,
     pollTimer: null,
+    profileTouched: false,   // user picked a profile explicitly
     charts: [],
     schemas: {},
     userPickedEngine: false,
@@ -32,6 +33,9 @@
     "decode_tps", "prefill_tps", "ttft_p50_ms", "ttft_p90_ms", "ttft_p99_ms",
     "itl_ms", "kv_pct", "vram_pct", "gpu_util", "power_w", "temp_c", "fan_pct",
     "running", "waiting", "vram_used_mib",
+    // KV offload tiers (sampled every kvcache.collect_interval_s)
+    "kv_cpu_used_pct", "kv_cpu_active_pct", "kv_disk_pct", "kv_disk_used_gb",
+    "kv_disk_read_mbps", "kv_disk_write_mbps",
   ];
 
   /* ── tiny helpers ───────────────────────────────────────────────────── */
@@ -192,6 +196,16 @@
         { key: "gpu_util", label: "SM util", color: "warn", width: 1.2 },
       ],
       left: "%", range: [0, 100],
+    },
+    {
+      id: "chart-kvoffload",
+      defs: [
+        { key: "kv_disk_pct", label: "磁盘占用", color: "violet", width: 2 },
+        { key: "kv_cpu_used_pct", label: "CPU 占用", color: "accent", width: 1.4 },
+        { key: "kv_disk_read_mbps", label: "读", color: "good", width: 1.2, scale: "y2" },
+        { key: "kv_disk_write_mbps", label: "写", color: "warn", width: 1.2, scale: "y2" },
+      ],
+      left: "%", right: "MiB/s", range: [0, 100],
     },
     {
       id: "chart-power",
@@ -429,6 +443,7 @@
     renderKpis(snap);
     renderEngineInfo(snap);
     renderGpu(snap);
+    renderKvCache(snap);
     renderSummary(snap);
     renderTokens(snap);
     updateTabStatus(ctrl, snap.live || []);
@@ -475,7 +490,12 @@
     $("#k-decode-sub").textContent = `ITL ${fmt(speed.itl_p50_ms, 1)}ms · 累计 ${fmtInt(tokens.generation)} tok`;
     $("#k-prefill").textContent = fmt(speed.prefill_tps, 0);
     $("#k-prefill-1m").textContent = fmt(speed.prefill_tps_60s, 0);
-    $("#k-prefill-sub").textContent = `prompt 均值 ${fmt(speed.prompt_tokens_avg, 0)} tok`;
+    // vLLM only books prompt tokens when a request completes, so a counter-rate
+    // reads 0 % during a long prefill. The live figure is derived from KV growth
+    // and the sub-line says which source is being shown.
+    const prefillSrc = speed.prefill_source === "live" ? "实时（KV 增长推算）" : "结算值";
+    $("#k-prefill-sub").textContent =
+      `prompt 均值 ${fmt(speed.prompt_tokens_avg, 0)} tok · ${prefillSrc}`;
     $("#k-ttft").textContent = fmt(speed.ttft_p50_ms, 0);
     $("#k-ttft-sub").textContent = `p90 ${fmt(speed.ttft_p90_ms, 0)} · p99 ${fmt(speed.ttft_p99_ms, 0)} ms`;
     $("#k-kv").textContent = fmt(cache.kv_pct, 1);
@@ -756,6 +776,9 @@
     const tokens = engine.tokens || {};
     const speed = engine.speed || {};
     const spec = engine.spec || {};
+    const kv = snap.kvcache || {};
+    const disk = kv.disk || {};
+    const cpu = kv.cpu || {};
 
     $("#info-engine").textContent = engine.ok ? `${model.engine} · ${model.served}` : (snap.engine_error || "engine not reachable");
 
@@ -769,12 +792,23 @@
       ["KV 页", `${fmtInt(cache.kv_used_pages)} / ${fmtInt(cache.kv_capacity_pages)}`],
       ["并发", cfg.max_concurrency ? fmt(cfg.max_concurrency, 2) : "—"],
       ["Prefix 查询/命中", `${fmtInt(cache.prefix_queries)} / ${fmtInt(cache.prefix_hits)}`],
-      ["投机", spec.backend ? `${spec.backend} · drafted ${fmtInt(spec.drafted)} · 接受 ${fmt((spec.accept_rate || 0) * 100, 1)}%` : "off"],
+      ["MTP 投机", spec.backend
+        ? `${spec.backend} · drafted ${fmtInt(spec.drafted)} · 接受 ${fmt((spec.accept_rate || 0) * 100, 1)}%`
+        : "off"],
       ["Prompt 总量", `${fmtInt(tokens.prompt)} tok`],
       ["生成总量", `${fmtInt(tokens.generation)} tok`],
       ["E2E p50/p90", `${fmt(speed.e2e_p50_ms, 0)} / ${fmt(speed.e2e_p90_ms, 0)} ms`],
       ["队列 p50", `${fmt(speed.queue_p50_ms, 1)} ms`],
       ["抢占 / replay", `${fmtInt(req.preemptions)} / ${fmtInt(req.replaying)}`],
+      ["磁盘 cache 目录", kv.enabled ? (kv.dir || "—") : "offload 已关闭"],
+      ["磁盘 cache 用量", kv.enabled
+        ? `${fmt((disk.used_bytes || 0) / 1024 ** 3, 2)} / ${fmt((disk.capacity_bytes || 0) / 1024 ** 3, 1)} GiB`
+          + (disk.limit_bytes ? `（上限 ${fmt(disk.limit_bytes / 1024 ** 3, 1)} GiB）` : "（不限）")
+        : "—"],
+      ["内存 cache", kv.enabled
+        ? `${fmt((cpu.budget_bytes || 0) / 1024 ** 3, 1)} GiB 预算 · 实占 `
+          + `${fmt((cpu.region_used_bytes || 0) / 1024 ** 3, 2)} GiB · 在飞 ${fmt(cpu.active_pct, 0)}%`
+        : "—"],
     ];
     const dl = $("#engine-info");
     dl.replaceChildren();
@@ -848,6 +882,95 @@
       state.historyTimer = null;
       loadHistory();
     }, 1200);
+  }
+
+  function renderKvCache(snap) {
+    const kv = snap.kvcache || {};
+    const box = $("#kv-tiers");
+    const dl = $("#kv-tier-info");
+    if (!box || !dl) return;
+    box.replaceChildren();
+    dl.replaceChildren();
+    const enabled = !!kv.enabled;
+    $("#kv-tier-hint").textContent = enabled
+      ? `${kv.dir || "—"} · 低频采样`
+      : "未启用（config.yaml → kvcache.enabled）";
+    const gpu = kv.gpu || {};
+    const cpu = kv.cpu || {};
+    const disk = kv.disk || {};
+    const gib = (bytes) => (bytes ? `${fmt(bytes / 1024 ** 3, 1)} GiB` : "—");
+    const mbps = (bps) => {
+      if (bps === null || bps === undefined) return "—";
+      if (bps >= 1024 ** 3) return `${fmt(bps / 1024 ** 3, 2)} GiB/s`;
+      if (bps >= 1024 ** 2) return `${fmt(bps / 1024 ** 2, 1)} MiB/s`;
+      return `${fmt(bps / 1024, 0)} KiB/s`;
+    };
+    const diskPct = disk.capacity_bytes
+      ? (Number(disk.used_bytes || 0) / Number(disk.capacity_bytes)) * 100
+      : null;
+    const rows = [
+      {
+        name: "GPU 显存",
+        pct: gpu.pct,
+        text: gpu.blocks
+          ? `${fmt(gpu.pct, 1)}% · ${fmtInt(gpu.blocks)} blocks`
+          : `${fmt(gpu.pct, 1)}%`,
+        color: "var(--good)",
+      },
+      {
+        name: "CPU 内存",
+        // vLLM 没有 CPU 层占用率指标，只在飞占用率。真实占用取自 tmpfs mmap
+        // 的实占块数（宿主机侧），所以这里显示「实占」，「在飞」只作参考。
+        pct: cpu.budget_bytes ? (100.0 * (cpu.region_used_bytes || 0)) / cpu.budget_bytes : cpu.active_pct,
+        text: `${gib(cpu.budget_bytes)} 预算 · 实占 ${gib(cpu.region_used_bytes)}`
+          + ` · 在飞 ${fmt(cpu.active_pct, 0)}%`,
+        color: "var(--accent)",
+        title: "实占 = /dev/shm 区域真正落地的内存；在飞 = 被进行中传输临时钉住的占比（vLLM 唯一暴露的指标）",
+      },
+      {
+        name: "磁盘",
+        pct: diskPct,
+        text: `${gib(disk.used_bytes)} / ${gib(disk.capacity_bytes)}`,
+        color: "var(--violet)",
+        title: disk.limit_bytes ? "受 kvcache.disk_limit_gb 限制" : "用满所在分区",
+      },
+    ];
+    for (const row of rows) {
+      const wrap = el("div", enabled ? "kv-tier" : "kv-tier off");
+      if (row.title) wrap.title = row.title;
+      wrap.append(el("span", "kv-tier-name", row.name));
+      const bar = el("div", "kv-bar");
+      const fill = el("i");
+      fill.style.width = `${Math.max(0, Math.min(100, Number(row.pct) || 0))}%`;
+      fill.style.background = row.color;
+      bar.append(fill);
+      wrap.append(bar);
+      wrap.append(el("span", "kv-tier-val", row.text));
+      box.append(wrap);
+    }
+    const info = [
+      ["磁盘 IO", `读 ${mbps(disk.read_bps)} · 写 ${mbps(disk.write_bps)}`],
+      ["磁盘命中", (disk.hit_rate === null || disk.hit_rate === undefined)
+        ? "—"
+        : `${fmt(disk.hit_rate * 100, 1)} %（${fmtInt(disk.hits)}/${fmtInt(disk.queries)} 块）`],
+      ["磁盘文件", `${fmtInt(disk.files)} 个${disk.limit_bytes ? ` · 上限 ${gib(disk.limit_bytes)}` : " · 不限"}`],
+      ["失败/丢弃", `升级失败 ${fmtInt(disk.promo_fail)} · 背压丢弃 ${fmtInt(disk.dropped_stores)}`],
+    ];
+    const health = kv.health || {};
+    info.push(["磁盘健康", health.error
+      ? `不可用：${health.error}`
+      : `已用 ${fmt(health.pct_used, 0)}% · ${fmt(health.temp_c, 1)}°C · 余量 ${fmt(health.spare_pct, 0)}%`
+        + ` · 媒体错误 ${fmtInt(health.media_errors)} · 累计写 ${fmt(health.written_gb, 0)} GiB`]);
+    if (kv.reclaim && kv.reclaim.last_at) {
+      const rec = kv.reclaim;
+      info.push(["上次回收", rec.error
+        ? `失败：${rec.error}`
+        : `${gib(rec.last_bytes)} / ${fmtInt(rec.last_files)} 个文件`]);
+    }
+    for (const [k, v] of info) {
+      dl.append(el("dt", null, k));
+      dl.append(el("dd", null, v));
+    }
   }
 
   function renderHistory(items) {
@@ -1030,14 +1153,20 @@
   function renderProfiles() {
     const sel = $("#profile");
     const current = sel.value;
-    const profiles = schema().profiles || [];
+    const sch = schema();
+    const profiles = sch.profiles || [];
     sel.replaceChildren();
     for (const name of profiles) {
       const option = el("option", null, name);
       option.value = name;
       sel.append(option);
     }
-    if (profiles.includes(current)) sel.value = current;
+    // The static <option> used to win here, which silently pinned the default to
+    // stage1. Only honour the current selection when the user actually changed it.
+    if (state.profileTouched && profiles.includes(current)) sel.value = current;
+    else if (sch.default_profile && profiles.includes(sch.default_profile)) {
+      sel.value = sch.default_profile;
+    } else if (profiles.includes(current)) sel.value = current;
     else if (profiles.length) sel.value = profiles[0];
   }
 
@@ -1048,9 +1177,22 @@
     const s = schema();
     const profile = $("#profile").value;
     const saved = savedOptions(state.engine);
+    const values = {};
     for (const opt of s.options || []) {
-      if (opt.show_if && Array.isArray(opt.show_if.profiles) && !opt.show_if.profiles.includes(profile)) {
-        continue;
+      values[opt.key] = saved[opt.key] !== undefined ? saved[opt.key] : opt.default;
+    }
+    const norm = (v) => (v === true ? "1" : v === false ? "0" : String(v ?? ""));
+    for (const opt of s.options || []) {
+      if (opt.show_if) {
+        const cond = opt.show_if;
+        let visible = true;
+        if (Array.isArray(cond.profiles) && !cond.profiles.includes(profile)) visible = false;
+        for (const [key, allowed] of Object.entries(cond)) {
+          if (key === "profiles") continue;
+          const list = (Array.isArray(allowed) ? allowed : [allowed]).map(norm);
+          if (!list.includes(norm(values[key]))) { visible = false; break; }
+        }
+        if (!visible) continue;
       }
       const field = el("label", "field");
       field.dataset.key = opt.key;
@@ -1587,6 +1729,7 @@
       });
     }
     $("#profile").addEventListener("change", () => {
+      state.profileTouched = true;
       renderEngineOptions();
       previewCommand();
     });

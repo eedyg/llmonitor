@@ -16,6 +16,10 @@ default_ctx: "128k"
 model_max_context: 262144
 served_model_name: "qwen3.8-27b"
 
+# Variables that carry a human-friendly size ("12G") and must reach the argv as
+# plain bytes. launcher.resolve() normalizes them via parse_size().
+size_vars: [cpu_bytes_to_use]
+
 models:
   # Same resolution order as run_llm.sh: first candidate containing <dir>/config.json
   dir_candidates:
@@ -29,6 +33,7 @@ defaults:
   # cache block. At gpu_mem_util 0.92 only ~250 blocks exist, so vLLM's default
   # max_num_seqs=256 makes CUDA-graph capture fail. Keep this below the blocks.
   max_num_seqs: "192"
+  max_num_batched_tokens: "2048"
   gpu_mem_util: "0.92"
   # fp8 halves the KV footprint; 256k fits (366,097 KV tokens = 1.40x).
   kv_cache_dtype: "fp8"
@@ -42,7 +47,16 @@ defaults:
   cors: "1"
   spec_metrics: "summary"
   kv_offload_gb: "4"
-  cpu_bytes_to_use: "6442450944"
+  # Tier-2 (CPU RAM) budget of the 3-tier KV offload layer, in bytes once
+  # normalized by size_vars. Overridden by config.yaml → kvcache.cpu_bytes_to_use.
+  cpu_bytes_to_use: "12G"
+  # Layer switch for the offload layer below (1 = append --kv-transfer-config).
+  # The monitor sets it from config.yaml → kvcache.enabled.
+  offload_enabled: "0"
+  # Disk-tier budget in GiB (0 = use the whole filesystem). vLLM's fs tier has
+  # no capacity limit of its own, so the monitor enforces this by reclaiming
+  # the oldest block files (see monitor/kvcache.py).
+  kv_disk_limit_gb: "0"
   spec_tokens:
     stage1: null
     mtp: "3"
@@ -98,6 +112,16 @@ engine_args:
   - "${gpu_mem_util}"
   - "--max-num-seqs"
   - "${max_num_seqs}"
+  # Per-step token budget = the chunked-prefill chunk size. Kept at vLLM's own
+  # default (2048): measured on this GPU (48 GB, 250 W cap) the gains are small
+  # and the trade-off is real —
+  #   2048 -> cold 127k prefill 51.4 s | 60 %-cache case 29.6 s
+  #   8192 -> 50.2 s (-2.3 %)          | 28.3 s (-4.4 %)   KV -1.5 %, disk IO +5x
+  #   32768 -> startup OOM (needs ~576 MiB more than the card has left).
+  # Raise it per-launch from the engine page when prefill latency matters more
+  # than decode ITL.
+  - "--max-num-batched-tokens"
+  - "${max_num_batched_tokens}"
   - "--enable-prefix-caching"
 
 conditional_args:
@@ -146,9 +170,39 @@ profiles:
           "eviction_policy":"arc",
           "secondary_tiers":[{"type":"fs","root_dir":"/kvoffload/${model_dir_name}",
             "n_read_threads":16,"n_write_threads":8,"locality":"LOCAL",
-            "backpressure":{"backpressure_cls":"DropStorePolicy"}}]}}
+            "backpressure":{"backpressure_cls":"EMABackpressureDetector",
+              "policy_cls":"DropStorePolicy"}}]}}
     mounts:
       - "${kvoffload_dir}:/kvoffload"
+
+# ── Layers ───────────────────────────────────────────────────────────────────
+# Orthogonal to `profiles`: a layer appends args/mounts whenever its `when`
+# holds, so a feature can be combined with any profile (mtp, dflash, …) instead
+# of living in a mutually-exclusive profile. The legacy kv2/kv3 profiles stay
+# for byte-compatibility with run_llm.sh, hence the not_in guard below.
+layers:
+  - when:
+      offload_enabled: {truthy: true}
+      profile: {not_in: [kv2, kv3]}
+    mounts:
+      - "${kvoffload_dir}:/kvoffload"
+    args:
+      # Hybrid (Mamba/linear-attention) models: without this the offload tiers
+      # *find* a cached prefix but vLLM cannot restore the recurrent state, so
+      # it silently recomputes everything (measured: 49.7 s wasted per request
+      # on a 120k prompt with a 72k shared prefix). With it, the tier hit is
+      # honoured: 49.7 s -> 27.1 s, 58.6 % hit rate.
+      - "--enable-mamba-shared-prefix-checkpoint"
+      - "--kv-transfer-config"
+      - |-
+        {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{
+          "spec_name":"TieringOffloadingSpec",
+          "cpu_bytes_to_use":${cpu_bytes_to_use},
+          "eviction_policy":"arc",
+          "secondary_tiers":[{"type":"fs","root_dir":"/kvoffload/${model_dir_name}",
+            "n_read_threads":16,"n_write_threads":8,"locality":"LOCAL",
+            "backpressure":{"backpressure_cls":"EMABackpressureDetector",
+              "policy_cls":"DropStorePolicy"}}]}}
 
 # Fields rendered by the web UI for THIS engine. `key` is the launcher variable
 # name, so adding a field never needs UI code.
@@ -169,6 +223,11 @@ options:
     type: int
     default: 192
     hint: "受 Mamba cache block 数限制（约 250）"
+  - key: max_num_batched_tokens
+    label: "prefill chunk (tokens/step)"
+    type: int
+    default: 2048
+    hint: "每步 token 预算 = chunk 大小。2048 是 vLLM 默认；8192 实测快 2~4%（KV −1.5%、磁盘 IO ×5）；32768 在本卡会 OOM"
   - key: gpu_mem_util
     label: "GPU 显存占比"
     type: float
@@ -203,6 +262,30 @@ options:
     label: "CORS"
     type: bool
     default: "1"
+  - key: offload_enabled
+    label: "KV offload（三级缓存）"
+    type: bool
+    default: "0"
+    hint: "开 = GPU → CPU 内存 → 磁盘；默认值来自 config.yaml → kvcache.enabled"
+  - key: cpu_bytes_to_use
+    label: "内存 cache"
+    type: size
+    default: "12G"
+    placeholder: "12G / 8192m / 12884901888"
+    show_if: {offload_enabled: [true, "1", "on"]}
+    hint: "第 2 级（CPU 主层）预算，默认 12 GiB"
+  - key: kvoffload_dir
+    label: "磁盘 cache 目录"
+    type: path
+    placeholder: "/mnt/kvcache/kvoffload"
+    show_if: {offload_enabled: [true, "1", "on"]}
+    hint: "宿主机路径，容器内挂到 /kvoffload；默认来自 config.yaml → kvcache.disk_dir"
+  - key: kv_disk_limit_gb
+    label: "磁盘 cache 上限 (GiB)"
+    type: int
+    default: 0
+    show_if: {offload_enabled: [true, "1", "on"]}
+    hint: "0 = 用满 cache 目录所在分区；>0 时由 monitor 回收最旧的块文件"
   - key: api_key
     label: "API Key"
     type: password

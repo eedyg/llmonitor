@@ -11,6 +11,7 @@ from .billing import snapshot_report
 from .config import Config
 from .docker_scope import Docker, Scope
 from .engine import EngineStore
+from .kvcache import KvCacheMonitor, parse_size as parse_kv_size
 from .nvml import GpuCollector
 from .store import Store
 from .tap import TapRegistry
@@ -34,6 +35,16 @@ class Runtime:
             fallback_csv=bool(cfg.root.gpu.fallback_csv),
         )
         self.engine = EngineStore(window_s=float(cfg.root.collect.rate_window_s))
+        kv = cfg.root.kvcache
+        self.kvcache = KvCacheMonitor(
+            enabled=bool(kv.enabled),
+            directory=cfg.p("kvcache.disk_dir"),
+            cpu_budget_bytes=parse_kv_size(kv.cpu_bytes_to_use) if bool(kv.enabled) else 0,
+            disk_limit_bytes=int(float(kv.disk_limit_gb or 0) * 1024 ** 3),
+            device=str(kv.device or ""),
+            interval_s=float(kv.collect_interval_s),
+            health_interval_s=float(kv.health_interval_s),
+        )
         self.taps = TapRegistry()
         self.controller: Any = None
         self.subscribers: set[asyncio.Queue] = set()
@@ -69,6 +80,13 @@ class Runtime:
         speed = snap.get("speed") or {}
         cache = snap.get("cache") or {}
         req = snap.get("requests") or {}
+        kv = self.kvcache.view()
+        kvc = kv.get("cpu") or {}
+        kvd = kv.get("disk") or {}
+        used = kvd.get("used_bytes") or 0
+        cap = kvd.get("capacity_bytes") or 0
+        read_bps = kvd.get("read_bps")
+        write_bps = kvd.get("write_bps")
         return {
             "ts": round(time.time(), 3),
             "decode_tps": speed.get("decode_tps"),
@@ -86,6 +104,16 @@ class Runtime:
             "power_w": gpu.get("power_w"),
             "temp_c": gpu.get("temp_c"),
             "fan_pct": gpu.get("fan_pct"),
+            # KV offload tiers (low-frequency samples, carried between ticks).
+            "kv_cpu_used_pct": (
+                round(100.0 * (kvc.get("region_used_bytes") or 0) / kvc["budget_bytes"], 2)
+                if kvc.get("budget_bytes") else None
+            ),
+            "kv_cpu_active_pct": kvc.get("active_pct"),
+            "kv_disk_pct": round(100.0 * used / cap, 2) if cap else None,
+            "kv_disk_used_gb": round(used / 1024 ** 3, 2),
+            "kv_disk_read_mbps": round(read_bps / 1024 ** 2, 2) if read_bps is not None else None,
+            "kv_disk_write_mbps": round(write_bps / 1024 ** 2, 2) if write_bps is not None else None,
         }
 
     def push_point(self) -> None:
@@ -103,6 +131,7 @@ class Runtime:
             "engine": self.engine.snapshot,
             "engine_error": self.engine.last_error,
             "gpu": self.gpu.info(),
+            "kvcache": self.kvcache.view(),
             "live": self.taps.snapshot(),
             "summary": self.store.summary(),
             "tokens": tokens,

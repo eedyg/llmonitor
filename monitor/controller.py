@@ -289,16 +289,72 @@ class Controller:
         )
         for key, value in dict(self.cfg.root.engine.extra_env or {}).items():
             env[str(key)] = str(value)
+        env.update(self.kvcache_env())
         if engine == "vllm" and opts.get("image"):
             env["VLLM_IMAGE"] = str(opts["image"])
         return cmd, env
+
+    def default_profile(self, engine: str | None = None) -> str:
+        """Configured default profile (config.yaml → engine.default_profile)."""
+        name = (engine or self.cfg.root.engine.default or "vllm").lower()
+        table = dict(self.cfg.root.engine.default_profile or {})
+        return str(table.get(name) or "stage1")
+
+    def apply_kvcache_defaults(self, schema: dict) -> None:
+        """Show the *effective* config as the option defaults in the UI."""
+        kv = self.cfg.root.kvcache
+        effective = {
+            "offload_enabled": "1" if bool(kv.enabled) else "0",
+            "cpu_bytes_to_use": str(kv.cpu_bytes_to_use),
+            "kv_disk_limit_gb": str(int(float(kv.disk_limit_gb or 0))),
+            "kvoffload_dir": str(self.cfg.p("kvcache.disk_dir")),
+        }
+        for opt in schema.get("options") or []:
+            key = opt.get("key")
+            if key in effective:
+                opt["default"] = effective[key]
+
+    def kvcache_vars(self) -> dict[str, str]:
+        """Engine variables for the KV offload layer (config.yaml → kvcache).
+
+        The layer itself is declarative (engines/vllm.yaml → layers) so the
+        monitor only decides *whether* it applies and with which budget.
+        """
+        kv = self.cfg.root.kvcache
+        enabled = bool(kv.enabled)
+        out = {
+            "offload_enabled": "1" if enabled else "0",
+            "kv_disk_limit_gb": str(int(float(kv.disk_limit_gb or 0))),
+        }
+        if enabled:
+            out["cpu_bytes_to_use"] = str(kv.cpu_bytes_to_use)
+            out["kvoffload_dir"] = str(self.cfg.p("kvcache.disk_dir"))
+        return out
+
+    def kvcache_env(self) -> dict[str, str]:
+        """Same settings as environment variables, for the run_llm.sh path."""
+        kv = self.cfg.root.kvcache
+        enabled = bool(kv.enabled)
+        env = {"KVCACHE_OFFLOAD": "1" if enabled else "0"}
+        if enabled:
+            size = launcher.parse_size(kv.cpu_bytes_to_use)
+            if size:
+                env["CPU_BYTES_TO_USE"] = str(size)
+            env["KVOFFLOAD_DIR"] = str(self.cfg.p("kvcache.disk_dir"))
+        return env
 
     def build_plan(self, opts: dict) -> LaunchPlan:
         engine = (opts.get("engine") or self.cfg.root.engine.default).lower()
         merged = dict(opts)
         merged.setdefault("host", str(self.cfg.root.engine.bind_host))
         merged["port"] = self.engine_port
-        merged.setdefault("profile", "stage1")
+        if not merged.get("profile"):
+            merged["profile"] = self.default_profile(engine)
+        # An explicit launch option always wins over config.yaml, so the UI can
+        # override the offload layer for a single start.
+        for key, value in self.kvcache_vars().items():
+            if merged.get(key) in (None, ""):
+                merged[key] = value
         if not merged.get("ctx"):
             merged["ctx"] = dict(self.cfg.root.engine.default_ctx).get(engine, "128k")
         if engine == "ninfer" and bool(self.cfg.root.engine.ninfer_jsonl):
@@ -350,6 +406,7 @@ class Controller:
             return {"ok": code == 0, "command": cmd, "output": out, "dry_run": True}
         engine = opts.get("engine") or self.cfg.root.engine.default
         self.kind = engine
+        self.rt.kvcache.apply_launch(self.kvcache_vars())
         self.rt.engine_api_key = str(opts.get("api_key") or "") or None
         self.start_command = cmd
         self._set("starting", f"launching {engine}…", engine)
@@ -377,6 +434,7 @@ class Controller:
             return {"ok": False, "error": plan.errors, "detail": detail, "plan": plan.public()}
 
         self.kind = plan.engine
+        self.rt.kvcache.apply_launch(dict(plan.vars or {}))
         self.rt.engine_api_key = str(opts.get("api_key") or "") or None
         self.start_command = plan.argv
         self._start_at = time.time()
@@ -435,8 +493,39 @@ class Controller:
             await asyncio.sleep(1.0)
         return round(time.time() - started, 1)
 
+    def _cleanup_offload_regions(self) -> list[str]:
+        """Delete leaked /dev/shm CPU-tier regions left by a killed engine.
+
+        vLLM mmaps the CPU tier as /dev/shm/vllm_offload_<engine_id>.mmap and
+        unlinks it on a clean shutdown. A container that was killed (stop, OOM,
+        crash) leaves a 12 GiB file behind, and the next start then fails its
+        /dev/shm free-space check — the engine refuses to boot until it is gone.
+        """
+        try:
+            files = sorted(Path("/dev/shm").glob("vllm_offload_*.mmap"))
+        except OSError:
+            return []
+        if not files:
+            return []
+        removed: list[str] = []
+        for start in range(0, len(files), 50):
+            chunk = files[start:start + 50]
+            try:
+                subprocess.run(
+                    ["sudo", "-n", "rm", "-f", "--", *[str(p) for p in chunk]],
+                    capture_output=True, text=True, timeout=60,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            removed += [str(p) for p in chunk if not p.exists()]
+        return removed
+
     async def _cleanup_before_start(self, plan: LaunchPlan) -> None:
         """Remove a stale stopped container / dead pidfile with the same identity."""
+        leaked = await asyncio.to_thread(self._cleanup_offload_regions)
+        if leaked:
+            self.rt.publish({"type": "engine_state", "state": "starting",
+                             "detail": f"cleaned {len(leaked)} leaked /dev/shm offload region(s)"})
         if plan.kind == "container":
             name = plan.container_name or self.cfg.root.engine.container_names.vllm
             code, out, _err = await asyncio.to_thread(

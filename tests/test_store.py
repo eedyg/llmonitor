@@ -204,14 +204,16 @@ def test_cache_ratio_is_persisted_and_survives_restart(tmp_path):
     assert history["cache_estimated"] is True
     assert history["cache_unknown"] is False
 
-    # engine restart: counters are back at 0, then a cold request arrives
+    # engine restart: counters are back at 0, then a cold request arrives.
+    # Deltas now accumulate, so the 10 cold tokens *do* dilute the ratio
+    # (900/1010) instead of being silently dropped.
     store.record_cache("vllm", 0, 0, now + 1)
     store.record_cache("vllm", 10, 0, now + 2)
-    assert store.token_totals()["history"]["prompt_cached"] == 900
+    assert store.token_totals()["history"]["prompt_cached"] == 891
 
     data = store.token_range(*day_window(None, None))
-    assert data["scope"]["prompt_cached"] == 900
-    assert data["daily"][-1]["prompt_cached"] == 900
+    assert data["scope"]["prompt_cached"] == 891
+    assert data["daily"][-1]["prompt_cached"] == 891
 
 
 def test_token_range_uses_each_day_cache_ratio(tmp_path):
@@ -279,3 +281,39 @@ def test_tiny_cache_sample_does_not_reprice_a_day(tmp_path):
     # 1k of 1M is 0.1% coverage -> fall back to the all-time ratio, not 0%
     assert day["cache_hit_pct"] > 99.0
     assert day["prompt_cached"] == data["scope"]["prompt_cached"]
+
+
+def test_record_cache_accumulates_deltas_across_engine_restarts(tmp_path):
+    """MAX() of two independently-resetting counters used to scramble the ratio."""
+    store = Store(tmp_path / "m.db")
+    now = time.time()
+    store.record_cache("vllm", 100, 40, now)          # first sample
+    store.record_cache("vllm", 200, 90, now + 1)      # +100 / +50
+    store.record_cache("vllm", 50, 10, now + 2)       # restart -> +50 / +10
+    store.record_cache("vllm", 50, 10, now + 3)       # idle repeat -> +0
+    row = store.db.execute("SELECT queries, hits FROM cache_daily").fetchone()
+    assert tuple(row) == (250, 100)
+    # a monitor restart must not lose the baseline (cache_state is persisted)
+    store2 = Store(tmp_path / "m.db")
+    store2.record_cache("vllm", 60, 20, now + 4)      # +10 / +10
+    row = store2.db.execute("SELECT queries, hits FROM cache_daily").fetchone()
+    assert tuple(row) == (260, 110)
+
+
+def test_hit_ratio_survives_a_benchmark_with_zero_reuse(tmp_path):
+    """A day with 60 % hits stays near 60 % after a huge zero-hit run + restart."""
+    store = Store(tmp_path / "m.db")
+    now = time.time()
+    store.record_cache("vllm", 20_000, 12_000, now)        # 60 %
+    store.record_cache("vllm", 2_500_000, 0, now + 1)      # benchmark, restart
+    q, h = store.db.execute("SELECT queries, hits FROM cache_daily").fetchone()
+    assert q == 2_500_000
+    assert h == 12_000
+    assert abs(h / q - 0.0048) < 0.001     # diluted, but not scrambled
+
+
+def test_record_cache_clamps_hits_to_queries(tmp_path):
+    store = Store(tmp_path / "m.db")
+    store.record_cache("vllm", 100, 500, time.time())
+    q, h = store.db.execute("SELECT queries, hits FROM cache_daily").fetchone()
+    assert (q, h) == (100, 100)

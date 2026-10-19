@@ -161,11 +161,18 @@ def build_api(rt: Runtime) -> FastAPI:
         for name in launcher.available_engines():
             try:
                 data[name] = launcher.engine_schema(name)
+                data[name]["default_profile"] = rt.controller.default_profile(name)
+                rt.controller.apply_kvcache_defaults(data[name])
             except Exception as exc:  # pragma: no cover
                 data[name] = {"engine": name, "error": str(exc), "options": []}
         return {"engines": data, "default": rt.cfg.root.engine.default,
                 "gateway_port": rt.controller.gateway_port,
                 "engine_port": rt.controller.engine_port}
+
+    @app.get("/api/kvcache")
+    async def kvcache() -> dict:
+        """KV cache tiers (GPU/CPU/disk) + disk health, low-frequency sampled."""
+        return rt.kvcache.view()
 
     @app.post("/api/engine/plan")
     async def engine_plan_post(payload: dict | None = None) -> dict:

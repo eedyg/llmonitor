@@ -114,6 +114,33 @@ async def series_loop(rt: Runtime) -> None:
         await asyncio.sleep(1.0)
 
 
+async def kvcache_loop(rt: Runtime) -> None:
+    """Low-frequency KV-tier sampling: capacity, tier IO, disk health.
+
+    Deliberately slow: walking the disk-cache directory costs real IO, and the
+    tiers move on the minute scale, not the second scale. Engine counters come
+    from the text the metrics loop already scraped, so this adds no scraping.
+    """
+    monitor = rt.kvcache
+    interval = max(5.0, float(monitor.interval_s))
+    while True:
+        now = time.time()
+        if not monitor.enabled:
+            # offload can be toggled per launch; keep the loop alive and idle.
+            await asyncio.sleep(interval)
+            continue
+        try:
+            raw = rt.engine.raw_text
+            metrics = Metrics(raw) if raw else None
+            monitor.collect_engine(metrics, now)
+            await asyncio.to_thread(monitor.collect_disk, now)
+            if monitor.health_due(now):
+                await asyncio.to_thread(monitor.collect_health, now)
+        except Exception as exc:  # pragma: no cover - never kill the monitor
+            log.debug("kvcache loop error: %s", exc)
+        await asyncio.sleep(interval)
+
+
 async def controller_loop(rt: Runtime) -> None:
     interval = float(rt.cfg.root.collect.runtime_interval_s)
     while True:
@@ -233,6 +260,7 @@ async def run(cfg: Config) -> None:
         asyncio.create_task(gpu_loop(rt), name="gpu"),
         asyncio.create_task(series_loop(rt), name="series"),
         asyncio.create_task(controller_loop(rt), name="controller"),
+        asyncio.create_task(kvcache_loop(rt), name="kvcache"),
         asyncio.create_task(jsonl_loop(rt), name="jsonl"),
         asyncio.create_task(maintenance_loop(rt), name="maintenance"),
     ]

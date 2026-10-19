@@ -62,6 +62,9 @@ CASES: list[dict] = [
     {"engine": "vllm", "profile": "kv2", "ctx": "128k"},
     {"engine": "vllm", "profile": "kv3", "ctx": "128k"},
     {"engine": "vllm", "profile": "kv3", "ctx": "128k", "env": {"CPU_BYTES_TO_USE": "4294967296"}},
+    # the orthogonal offload layer (config.yaml → kvcache.enabled) must render
+    # exactly like run_llm.sh KVCACHE_OFFLOAD=1
+    {"engine": "vllm", "profile": "mtp", "ctx": "128k", "env": {"KVCACHE_OFFLOAD": "1"}},
     {"engine": "vllm", "profile": "stage1", "ctx": "128k",
      "env": {"MAX_NUM_SEQS": "128", "GPU_MEM_UTIL": "0.9"}},
     {"engine": "vllm", "profile": "stage1", "ctx": "128k", "env": {"API_KEY": "sk-test"}},

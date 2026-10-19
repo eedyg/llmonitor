@@ -44,9 +44,11 @@ ENV_OPTS: dict[str, str] = {
     "MAMBA_SSM_CACHE_DTYPE": "mamba_ssm_cache_dtype",
     "GPU_MEM_UTIL": "gpu_mem_util",
     "MAX_NUM_SEQS": "max_num_seqs",
+    "MAX_NUM_BATCHED_TOKENS": "max_num_batched_tokens",
     "KV_CACHE_DTYPE": "kv_cache_dtype",
     "KV_OFFLOAD_GB": "kv_offload_gb",
     "CPU_BYTES_TO_USE": "cpu_bytes_to_use",
+    "KVCACHE_OFFLOAD": "offload_enabled",
     "KVOFFLOAD_DIR": "kvoffload_dir",
     "RESTART_POLICY": "restart_policy",
     "SPEC_TOKENS": "spec_tokens",
@@ -237,6 +239,12 @@ def _cond_ok(value: Any, cond: Any) -> bool:
             elif op == "present":
                 if bool(value) != bool(arg):
                     return False
+            elif op == "in":
+                if str(value if value is not None else "") not in [str(a) for a in arg]:
+                    return False
+            elif op == "not_in":
+                if str(value if value is not None else "") in [str(a) for a in arg]:
+                    return False
             else:
                 raise SpecError(f"unknown condition operator '{op}'")
         return True
@@ -341,8 +349,22 @@ def resolve(
         if not changed:
             break
 
+    # ── size-typed variables ("12G" -> 12884901888) ─────────────────────────
+    # Sizes must be rendered into JSON/mount strings as plain bytes, so they are
+    # normalized once here instead of in every spec that references them.
     warnings: list[str] = []
     errors: list[str] = []
+    for key in spec.get("size_vars") or []:
+        raw = variables.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            variables[key] = str(parse_size(raw))
+        except (TypeError, ValueError):
+            errors.append(
+                f"invalid size for {key}: {raw!r} (use 12884901888, 12g, 1024m)"
+            )
+
     profile = str(variables["profile"])
     profiles = spec.get("profiles") or {}
     unsupported = spec.get("unsupported_profiles") or {}
@@ -481,6 +503,18 @@ def resolve(
             engine_args += _render_list(rule.get("args"), variables, "conditional_args")
     engine_args += _render_list(profile_spec.get("args"), variables, "profile.args")
 
+    # ── layers: orthogonal to the profile ──────────────────────────────────
+    # A layer adds args/mounts whenever its `when` condition holds, so a feature
+    # such as KV offload can be combined with any profile (mtp, dflash, …)
+    # instead of being baked into a mutually-exclusive profile.
+    layer_mounts: list[str] = []
+    for layer in spec.get("layers") or []:
+        if not _when_ok(layer.get("when"), variables):
+            continue
+        layer_args = _render_list(layer.get("args"), variables, "layers.args")
+        engine_args += layer_args
+        layer_mounts += _render_list(layer.get("mounts"), variables, "layers.mounts")
+
     flags_cfg = spec.get("profile_flags") or {}
     profile_flags: list[str] = []
     for name, rule in flags_cfg.items():
@@ -519,6 +553,10 @@ def resolve(
             env_vars[str(key)] = str(_render(value, variables, "container.env"))
             argv += ["-e", f"{key}={env_vars[str(key)]}"]
         for mount in _render_list(profile_spec.get("mounts"), variables, "profile.mounts"):
+            if mount not in mounts:
+                mounts.append(mount)
+                argv += ["-v", mount]
+        for mount in layer_mounts:
             if mount not in mounts:
                 mounts.append(mount)
                 argv += ["-v", mount]
