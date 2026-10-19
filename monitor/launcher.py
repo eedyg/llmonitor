@@ -432,9 +432,12 @@ def resolve(
                 )
             else:
                 warnings.append(
-                    f"Context {ctx} on vLLM is KV-tight at {kv_cache_dtype} KV: measured 295,827 KV "
-                    "tokens = 1.13x concurrency for a full-window request (2x 128k still fits). "
-                    "Long concurrent requests will queue; lower ctx to raise concurrency."
+                    f"Context {ctx} on vLLM is KV-tight at {kv_cache_dtype} KV: the pool holds "
+                    "295,827 tokens = 1.13x a full-window request. vLLM admits a request against "
+                    "max_model_len (not its actual prompt), so at 256k only one long request is "
+                    "resident at a time (measured running=1 for 2x128k). Prefill is chunked but "
+                    "never parallel in 0.31 (max_num_partial_prefills was removed), so concurrency "
+                    "buys decode overlap only — lower ctx if you need several long requests to fit."
                 )
         if profile == "dflash":
             draft = Path(str(variables["models_dir"])) / str(variables["dflash_dir_name"]) / "config.json"
