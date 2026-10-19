@@ -28,7 +28,7 @@ DEFAULTS: dict[str, Any] = {
         "bind_host": "127.0.0.1",
         "container_names": {"vllm": "vllm-qwen38", "ninfer": "ninfer-qwen38"},
         "profiles": ["stage1", "mtp", "dflash", "dflash2", "kv2", "kv3"],
-        "default_ctx": {"vllm": "256k", "ninfer": "256k"},
+        "default_ctx": {"vllm": "128k", "ninfer": "256k"},
         "stop_grace_s": 25,
         "health_timeout_s": 1800,
         "health_poll_s": 2.0,

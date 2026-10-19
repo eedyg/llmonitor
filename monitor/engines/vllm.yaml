@@ -12,7 +12,7 @@ kind: container
 
 container_name: vllm-qwen38
 image: "vllm/vllm-openai:cu130-sm120"
-default_ctx: "256k"
+default_ctx: "128k"
 model_max_context: 262144
 served_model_name: "qwen3.8-27b"
 
