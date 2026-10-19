@@ -89,7 +89,7 @@ DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "cpu_bytes_to_use": "12G",
         "disk_dir": "/mnt/kvcache/kvoffload",
-        "disk_limit_gb": 0,
+        "disk_limit_gb": 64,
         "eviction_policy": "arc",
         "collect_interval_s": 30.0,
         "health_interval_s": 120.0,

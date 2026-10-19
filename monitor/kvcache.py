@@ -413,8 +413,11 @@ class KvCacheMonitor:
         used, files = dir_usage(self.directory) if self.directory.exists() else (0, 0)
         capacity, free = filesystem_usage(self.directory)
         reserve = self._reserve(capacity)
-        # explicit cap wins; "0 = use all" becomes "all but the reserve"
-        effective = int(self.disk_limit_bytes) if self.disk_limit_bytes > 0 else max(capacity - reserve, 0)
+        # explicit cap wins, but it can never exceed "filesystem minus reserve":
+        # a hand-written 200 on a 98 GiB volume would otherwise recreate the
+        # ENOSPC storm this reserve exists to prevent. "0 = use all" = capacity − reserve.
+        safe = max(capacity - reserve, 0)
+        effective = min(int(self.disk_limit_bytes), safe) if self.disk_limit_bytes > 0 else safe
         snap["disk"]["used_bytes"] = used
         snap["disk"]["files"] = files
         snap["disk"]["capacity_bytes"] = capacity

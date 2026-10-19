@@ -321,3 +321,14 @@ def test_near_full_flags_a_disk_about_to_run_out(tmp_path, monkeypatch):
     mon = make_monitor(tmp_path, disk_limit_bytes=0)
     mon.collect_disk(now=1.0, reclaim=False)
     assert mon.view()["disk"]["near_full"] is True
+
+
+def test_explicit_cap_cannot_exceed_the_safe_limit(tmp_path, monkeypatch):
+    """手滑写个 200 不该能突破「分区 − 保留区」。"""
+    gib = 1024 ** 3
+    monkeypatch.setattr(kvcache, "filesystem_usage", lambda _p: (98 * gib, 40 * gib))
+    mon = make_monitor(tmp_path, disk_limit_bytes=200 * gib)
+    mon.collect_disk(now=1.0, reclaim=False)
+    disk = mon.view()["disk"]
+    assert disk["limit_bytes"] == 200 * gib          # 配置原样回显
+    assert disk["effective_limit_bytes"] == 98 * gib - disk["reserve_bytes"]
