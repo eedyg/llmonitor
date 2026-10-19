@@ -106,7 +106,13 @@ TOKEN_FIELDS = f"""
        COALESCE(SUM(COALESCE(content_tokens, 0)), 0),
        COUNT(prompt_cached),
        MIN(started_at),
-       MAX(started_at)"""
+       MAX(started_at),
+       COALESCE(SUM(CASE WHEN prompt_cached IS NOT NULL THEN {PROMPT_EXPR} ELSE 0 END), 0)"""
+
+# per-request cached_tokens only exist for rows written after vLLM started
+# returning them (--enable-prompt-tokens-details, 2026-10-20). Using that partial
+# sum for a whole day silently turned a 77 % day into 2.9 %.
+PER_REQUEST_CACHE_MIN_COVERAGE = 0.5
 
 TOKEN_SQL = "SELECT" + TOKEN_FIELDS + "\n  FROM requests"
 
@@ -128,7 +134,8 @@ SELECT strftime('%Y-%m-%d', started_at, 'unixepoch', 'localtime') AS day,
        COALESCE(SUM(CASE WHEN {peak} THEN {prompt} ELSE 0 END), 0),
        COALESCE(SUM(CASE WHEN {peak} THEN COALESCE(prompt_cached, 0) ELSE 0 END), 0),
        COALESCE(SUM(CASE WHEN {peak} THEN COALESCE(thinking_tokens, 0) ELSE 0 END), 0),
-       COALESCE(SUM(CASE WHEN {peak} THEN COALESCE(content_tokens, 0) ELSE 0 END), 0)
+       COALESCE(SUM(CASE WHEN {peak} THEN COALESCE(content_tokens, 0) ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN prompt_cached IS NOT NULL THEN {prompt} ELSE 0 END), 0)
   FROM requests
  WHERE started_at >= ? AND started_at < ?
  GROUP BY day
@@ -445,6 +452,7 @@ class Store:
             "cached_rows": int(row[offset + 5] or 0),
             "first_at": row[offset + 6] if len(row) > offset + 6 else None,
             "last_at": row[offset + 7] if len(row) > offset + 7 else None,
+            "prompt_with_cached": int(row[offset + 8] or 0) if len(row) > offset + 8 else 0,
         }
 
     def _token_scope(self, since: float | None, until: float | None = None) -> dict:
@@ -481,7 +489,14 @@ class Store:
         peak_content = int(peak.get("content") or 0)
         estimated = False
         unknown = False
-        if not raw["cached_rows"] and prompt:
+        prompt_with_cached = int(raw.get("prompt_with_cached") or 0)
+        coverage = (prompt_with_cached / prompt) if prompt else 0.0
+        # Trust the per-request numbers only when they cover most of the window.
+        # Partial coverage (e.g. a day that mixes pre- and post-flag rows) must
+        # fall back to the engine's cumulative counters, otherwise the partial
+        # sum masquerades as "the day only had 3 % cache hits".
+        rows_usable = bool(raw["cached_rows"]) and coverage >= PER_REQUEST_CACHE_MIN_COVERAGE
+        if not rows_usable and prompt:
             if cache_ratio:
                 cached = min(prompt, int(round(prompt * cache_ratio)))
                 # same ratio for the peak subset: the engine only knows a global one
@@ -579,6 +594,9 @@ class Store:
             raw = self._rows_to_raw(row, 1)
             raw.pop("first_at", None)
             raw.pop("last_at", None)
+            # 这一列的 order 与 TOKEN_FIELDS 不同（DAILY 没有 first_at/last_at），
+            # 必须显式取，否则会把 peak_thinking 当成覆盖率分子。
+            raw["prompt_with_cached"] = int(row[11] or 0)
             raw["peak"] = {
                 "prompt": int(row[7] or 0),
                 "prompt_cached": min(int(row[8] or 0), int(row[7] or 0)),

@@ -317,3 +317,37 @@ def test_record_cache_clamps_hits_to_queries(tmp_path):
     store.record_cache("vllm", 100, 500, time.time())
     q, h = store.db.execute("SELECT queries, hits FROM cache_daily").fetchone()
     assert (q, h) == (100, 100)
+
+
+def test_partial_per_request_cache_falls_back_to_the_engine_ratio():
+    """启用 cached_tokens 那天不能把「部分覆盖」当成全天命中率。
+
+    真实事故：10-19 只有 3.4% 的请求带 cached_tokens，于是当天被算成 2.9%，
+    而引擎计数器（cache_daily）覆盖全量、真实是 77.6%。
+    """
+    from monitor.store import Store
+
+    raw = {
+        "requests": 10, "prompt": 100_000, "prompt_cached": 9_000,
+        "cached_rows": 1, "prompt_with_cached": 10_000,
+        "thinking": 0, "content": 0, "peak": {},
+    }
+    out = Store._finish_scope(raw, cache_ratio=0.8)
+    assert out["prompt_cached"] == 80_000        # 引擎比率，而不是那 9,000
+    assert out["cache_estimated"] is True
+    assert out["cache_hit_pct"] == 80.0
+
+
+def test_full_per_request_cache_coverage_wins():
+    """覆盖率足够时用逐请求真值（比引擎的全局比率更准）。"""
+    from monitor.store import Store
+
+    raw = {
+        "requests": 10, "prompt": 100_000, "prompt_cached": 61_000,
+        "cached_rows": 10, "prompt_with_cached": 100_000,
+        "thinking": 0, "content": 0, "peak": {},
+    }
+    out = Store._finish_scope(raw, cache_ratio=0.8)
+    assert out["prompt_cached"] == 61_000
+    assert out["cache_estimated"] is False
+    assert out["cache_hit_pct"] == 61.0
