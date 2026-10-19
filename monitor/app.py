@@ -241,7 +241,7 @@ def _preflight(cfg: Config) -> None:
         raise SystemExit(
             f"gateway port {gw} is already in use.\n"
             f"  Most likely the engine is still listening on {gw}: the monitor owns the public\n"
-            f"  port and the engine must move to {engine} (run_llm.sh HOST_PORT={engine}).\n"
+            f"  port and the engine must move to {engine} (engine.bind_host/port).\n"
             f"  Either stop what holds :{gw} or set MONITOR_GATEWAY_PORT to a free port."
         )
     if not _port_free(str(cfg.root.server.ui_host), ui):

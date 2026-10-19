@@ -7,8 +7,8 @@
 # ---------------------------------------------------------------------------
 
 paths:
-  run_llm: "../run_llm.sh"     # the existing launcher (engines are started through it)
-  run_dir: "../run"            # run_llm.sh RUN_DIR (pid files + engine logs)
+  # run_llm.sh 已淘汰：启动命令由 monitor/launcher.py 依据 engines/*.yaml 原生构建。
+  run_dir: "../run"            # pid files + engine logs
   state_dir: "./state"         # monitor's own sqlite db / start logs
 
 server:
@@ -39,19 +39,16 @@ engine:
   default_ctx:
     vllm: "128k"
     ninfer: "256k"
-  # P2b: build the launch command natively from engines/*.yaml instead of
-  # shelling out to ../run_llm.sh. Set false (or MONITOR_ENGINE_LAUNCHER=0) to
-  # fall back to the old path.
-  launcher: true
   stop_grace_s: 25
   health_timeout_s: 1800
   health_poll_s: 2.0
-  # Ask run_llm.sh to start NInfer with the full-precision JSONL request log.
+  # Start NInfer with the full-precision JSONL request log.
   # It is trimmed by the `logs` section below (NInfer itself never rotates it).
   ninfer_jsonl: true
   ninfer_jsonl_path: "../run/ninfer-requests.jsonl"
   ninfer_stats_interval_ms: 1000
-  # Extra env passed to run_llm.sh (e.g. API_KEY, GPU_MEM_UTIL).
+  # Extra engine env (e.g. API_KEY, GPU_MEM_UTIL); the launcher reads the same
+  # variable names from this mapping.
   extra_env: {}
 
 gateway:

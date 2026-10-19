@@ -62,7 +62,6 @@ def build_api(rt: Runtime) -> FastAPI:
     async def config() -> dict:
         data = cfg.as_dict()
         data["server"]["auth_token"] = "***" if data["server"]["auth_token"] else ""
-        data["paths"]["run_llm"] = str(cfg.p("paths.run_llm"))
         data["paths"]["run_dir"] = str(cfg.p("paths.run_dir"))
         data["paths"]["state_dir"] = str(cfg.p("paths.state_dir"))
         data["storage"]["db"] = str(cfg.p("storage.db"))
@@ -147,13 +146,8 @@ def build_api(rt: Runtime) -> FastAPI:
         return await rt.controller.probe(extended=extended)
 
     async def _plan_payload(opts: dict) -> dict:
-        if rt.controller.use_launcher:
-            plan = await asyncio.to_thread(rt.controller.build_plan, opts)
-            return plan.public()
-        cmd, _env = rt.controller.build_command(opts)
-        return {"engine": opts.get("engine"), "kind": "run_llm.sh", "ok": True,
-                "command": cmd, "argv": cmd, "warnings": [], "errors": [],
-                "plan_source": "run_llm.sh"}
+        plan = await asyncio.to_thread(rt.controller.build_plan, opts)
+        return plan.public()
 
     @app.get("/api/engines")
     async def engines() -> dict:
@@ -194,8 +188,9 @@ def build_api(rt: Runtime) -> FastAPI:
                       kv_capacity: str | None = None, spec_tokens: str | None = None) -> dict:
         opts = {"engine": engine, "profile": profile, "ctx": ctx,
                 "kv_capacity": kv_capacity, "spec_tokens": spec_tokens}
-        cmd, _env = rt.controller.build_command(opts)
-        return {"command": cmd}
+        plan = await asyncio.to_thread(rt.controller.build_plan, opts)
+        return {"command": plan.argv, "argv": plan.argv, "ok": plan.ok,
+                "warnings": plan.warnings, "errors": plan.errors}
 
     # -- docker (vLLM scope only) -------------------------------------------
     DOCKER_JOB_MAX = 40

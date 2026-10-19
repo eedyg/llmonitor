@@ -279,7 +279,7 @@ def llm_dry_run(engine: str = "vllm", profile: str = "stage1", ctx: str | None =
     """Show the exact launch plan the monitor would execute, without running it.
 
     Returns the resolved argv, mounts, env, labels, warnings and preflight errors
-    (and `plan_source`: launcher or run_llm.sh).
+    (plus `plan_source`).
     """
     return _get("/api/engine/plan", engine=engine, profile=profile, ctx=ctx,
                 kv_capacity=kv_capacity, spec_tokens=spec_tokens)

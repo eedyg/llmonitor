@@ -1,6 +1,7 @@
 # llm-monitor
 
-统一控制面 + 观测面，同时支持 **vLLM** 与 **NInfer**（通过上一层目录的 `../run_llm.sh` 编排）。
+统一控制面 + 观测面，同时支持 **vLLM** 与 **NInfer**。启动命令由 `launcher.py` 依据
+`engines/{vllm,ninfer}.yaml` **原生构建**；曾经的 `../run_llm.sh` 已淘汰（见文末「迁移」）。
 
 一个进程、一个网页、一套 MCP 工具：起停 / 切换引擎、看实时吞吐与延迟、看每一条请求的
 prefill/thinking/output/缓存命中、看 GPU 功耗温度风扇显存降频。
@@ -16,7 +17,7 @@ prefill/thinking/output/缓存命中、看 GPU 功耗温度风扇显存降频。
         │  API/WS ──── State Store (ring 2h + SQLite 30d) ──── /metrics │
         │     ▲                 ▲            ▲                          │
         │  Controller     Collectors     Gateway Tap (0 buffer)         │
-        │  run_llm.sh     /metrics 2s    passthrough + SSE tee          │
+        │  launcher.py    /metrics 2s    passthrough + SSE tee          │
         │  start/stop     NVML 1s        per-request accounting         │
         │                 JSONL tail                                    │
         └───────┬──────────────┬────────────────────────────────────────┘
@@ -52,7 +53,7 @@ cd ~/workspace/llm/monitor
 `:8000`、引擎必须退到 `:8001`。停止旧引擎后由 UI（或 MCP）重新拉起即可：
 
 ```bash
-../run_llm.sh --engine vllm --stop
+curl -s -X POST localhost:9000/api/engine/stop -d '{}'
 ./run.sh
 ```
 
@@ -65,8 +66,7 @@ curl -X POST localhost:9000/api/engine/start \
 ```
 
 > 说明：monitor 启动的引擎等价于
-> `HOST_PORT=8001 COMPAT=0 ../run_llm.sh --engine X --profile Y --host 127.0.0.1 -- ...`
-> 不需要修改 `run_llm.sh`。
+> 引擎参数在 `engines/*.yaml` 里声明；UI 引擎页 / `POST /api/engine/start` 覆盖单次启动即可。
 
 ## 端口
 
@@ -77,13 +77,13 @@ curl -X POST localhost:9000/api/engine/start \
 | 8001 | 当前引擎（仅 127.0.0.1） | monitor 内部 |
 | 9001 | 可选：MCP streamable-http | agent |
 
-客户端只认 `:8000`，切换引擎对客户端完全透明（`run_llm.sh` 的契约：同一 model 名、同一
+客户端只认 `:8000`，切换引擎对客户端完全透明（契约：同一 model 名、同一
 协议、同一路径）。
 
 ## 引擎启动（P2b：已接管）
 
 启动命令现在由声明式 spec 生成，controller **默认直接执行 `LaunchPlan`**，不再经过
-`run_llm.sh`：
+原生 launcher：
 
 ```bash
 ./run.sh engine --engine vllm --profile mtp --ctx 128k      # 打印计划（不执行）
@@ -98,7 +98,7 @@ curl -X POST localhost:9000/api/engine/start \
 * `monitor/launcher.py`：`resolve(engine, opts, env) -> LaunchPlan{argv, mounts, env, labels, warnings, errors}`
 
 回退开关：`MONITOR_ENGINE_LAUNCHER=0`（或 `engine.launcher: false`）→ 退回旧的
-`../run_llm.sh` 路径。两条路径共用同一个状态机。
+`engines/*.yaml`。启动路径只有一条（run_llm.sh 已淘汰）。
 
 启动过程不再是黑盒：
 
@@ -112,13 +112,13 @@ curl -X POST localhost:9000/api/engine/start \
   rebind 的限制）
 
 等价性由
-`tools/parity.py` 证明：它把假 `docker` / 假 `ninfer-serve` 放进 PATH，让 `run_llm.sh`
+`tests/test_launch_golden.py` 冻结了整张矩阵的 argv：它在 `run_llm.sh` 仍然可用、
 走真实启动路径并抓取 argv（NUL 分隔，能正确处理 kv3 的多行 JSON），再和 `LaunchPlan.argv`
 逐参数对比。
 
 ```bash
-../.venv/bin/python tools/parity.py        # 31/31 cases match（launcher 与 run_llm.sh）
-../.venv/bin/python tools/parity.py -v     # 逐条用例
+../.venv/bin/python -m pytest -q tests/test_launch_golden.py   # 32 例 argv 契约
+# 有意改动启动参数后：MONITOR_UPDATE_GOLDEN=1 重新生成 tests/golden/launch_argv.json
 ```
 
 实测（P2b）：`vllm → ninfer → vllm` 真实切换两次，脚本启动与 launcher 启动结果一致；
@@ -390,7 +390,7 @@ monitor 是数据面单点：它挂了，`:8000` 就没了（引擎仍在 `:8001
 ```bash
 ../.venv/bin/python -m pytest -q     # 73 个单测：prom/SSE/compat/docker scope/launcher/
                                      #   startup/token 账本(区间·分日·峰谷)/日志截断/DB 上限/MCP 形状
-../.venv/bin/python tools/parity.py  # 31 个 launcher ⇄ run_llm.sh 对拍用例
+../.venv/bin/python -m pytest -q tests/test_launch_golden.py  # 32 个 argv 契约用例
 ../.venv/bin/python tools/shot.py http://127.0.0.1:9000/ /tmp/ui.png --height 3600   # 截图
 ../.venv/bin/python tools/shot.py http://127.0.0.1:9000/ /tmp/ui.png \
     --eval "document.querySelector('#tok-apply').click()"        # 截"点击之后"的界面
@@ -411,22 +411,23 @@ monitor/
 ├── store.py       ring buffer + SQLite（请求历史 / token 账本 / 电量）
 ├── billing.py     token → 元（DeepSeek 峰谷价目）＋ GPU 电费
 ├── maintenance.py 日志原地截断 + DB 硬上限（磁盘边界）
-├── controller.py  run_llm.sh 编排 + 状态机 + 契约探针
+├── controller.py  生命周期状态机 + 契约探针
 ├── api.py         REST / WS / 静态页 / Prometheus 导出
 ├── app.py         两个 uvicorn + 采集循环
 ├── docker_scope.py  docker 作用域（白名单 verb + 逐对象校验）
-├── launcher.py    engines/*.yaml -> LaunchPlan（run_llm.sh 的替代品）
+├── launcher.py    engines/*.yaml -> LaunchPlan（唯一的启动路径）
 ├── engines/       vllm.yaml · ninfer.yaml（profiles/mounts/env/preflight）
 ├── mcp_server.py  MCP（stdio / http），工具文档见 MCP.md
 └── web/           index.html · style.css · app.js · vendor/uPlot
 
-tests/             pytest；tools/  parity.py（launcher 对拍）· bench.py · shot.py（CDP 截图）
+tests/             pytest（含 golden argv 契约）；tools/  bench.py · shot.py（CDP 截图）
 ```
 
 ## FAQ
 
 **启动报 "gateway port 8000 is already in use"？**
-引擎还在 8000。`../run_llm.sh --stop` 后由 monitor 接管，或临时 `MONITOR_GATEWAY_PORT=8010`。
+引擎还在 8000。先停掉旧引擎（UI 或 `POST /api/engine/stop`）再由 monitor 接管，
+或临时 `MONITOR_GATEWAY_PORT=8010`。
 
 **切换引擎要多久？**
 vLLM 冷启动要重新加载权重/编译 kernel，几分钟；NInfer 大约 10 秒。UI 顶部会显示状态与进度，
@@ -464,5 +465,5 @@ vLLM 冷启动要重新加载权重/编译 kernel，几分钟；NInfer 大约 10
 
 只有 Docker 容器日志不归我们管（文件在 `/var/lib/docker`），如果 vLLM 跑很久，给容器加
 `--log-opt max-size=64m --log-opt max-file=2`（或在 `/etc/docker/daemon.json` 里设
-`log-opts`）。注意这行会改变 `engines/vllm.yaml` 的 argv，`tools/parity.py` 与
-`run_llm.sh --dry-run` 的逐字节对比需要同步更新。
+`log-opts`）。注意这行会改变 `engines/vllm.yaml` 的 argv，
+`tests/golden/launch_argv.json` 需要用 `MONITOR_UPDATE_GOLDEN=1` 同步更新。

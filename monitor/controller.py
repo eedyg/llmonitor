@@ -1,8 +1,9 @@
 """Engine lifecycle: start / stop / restart / switch / probe.
 
-P2b: the launch command is built natively from engines/*.yaml (launcher.py).
-Set `engine.launcher: false` (or MONITOR_ENGINE_LAUNCHER=0) to fall back to the
-old `../run_llm.sh` path.
+The launch command is built natively from engines/*.yaml (launcher.py).
+run_llm.sh has been retired: it was the original orchestrator, the yaml specs now
+carry every profile/flag it used to build, and tests/test_launch_golden.py freezes
+the exact argv of the whole profile×ctx matrix.
 """
 
 from __future__ import annotations
@@ -86,12 +87,9 @@ class Controller:
 
     # -- paths / helpers ----------------------------------------------------
     @property
-    def run_llm(self) -> Path:
-        return self.cfg.p("paths.run_llm")
-
-    @property
     def project_dir(self) -> Path:
-        return self.run_llm.parent
+        """Project root that holds models/, run/ and the monitor."""
+        return self.run_dir.parent
 
     @property
     def run_dir(self) -> Path:
@@ -104,10 +102,6 @@ class Controller:
     @property
     def gateway_port(self) -> int:
         return int(self.cfg.root.server.gateway_port)
-
-    @property
-    def use_launcher(self) -> bool:
-        return bool(self.cfg.root.engine.launcher)
 
     def _set(self, state: str, detail: str | None = None, kind: str | None = None) -> None:
         changed = state != self.state or detail != self.detail
@@ -135,9 +129,7 @@ class Controller:
             "engine_port": self.engine_port,
             "gateway_port": self.gateway_port,
             "gpu_free_mib": self._gpu_free,
-            "run_llm": str(self.run_llm),
-            "launcher": self.use_launcher,
-            "plan_source": "launcher" if self.use_launcher else "run_llm.sh",
+            "plan_source": "launcher",
             "startup": self.startup,
             "image": getattr(self.rt, "image_override", None),
             "profiles": list(self.cfg.root.engine.profiles),
@@ -238,62 +230,6 @@ class Controller:
             self._set("stopped", "engine is not running")
 
     # -- command / plan building -------------------------------------------
-    def build_command(self, opts: dict, dry_run: bool = False) -> tuple[list[str], dict[str, str]]:
-        """Legacy path: shell out to ../run_llm.sh (launcher disabled)."""
-        engine = (opts.get("engine") or self.cfg.root.engine.default).lower()
-        if engine not in ("vllm", "ninfer"):
-            raise ValueError(f"unknown engine '{engine}'")
-        profile = opts.get("profile") or "stage1"
-        if profile not in list(self.cfg.root.engine.profiles):
-            raise ValueError(f"unknown profile '{profile}'")
-        ctx = opts.get("ctx") or dict(self.cfg.root.engine.default_ctx).get(engine, "128k")
-
-        cmd: list[str] = [
-            str(self.run_llm),
-            "--engine", engine,
-            "--profile", str(profile),
-            "--host", str(self.cfg.root.engine.bind_host),
-            "--ctx", str(ctx),
-        ]
-        if opts.get("kv_capacity"):
-            cmd += ["--kv-capacity", str(opts["kv_capacity"])]
-        if opts.get("spec_tokens"):
-            cmd += ["--spec-tokens", str(opts["spec_tokens"])]
-        if opts.get("model_dir"):
-            cmd += ["--model-dir", str(opts["model_dir"])]
-        if opts.get("served_name"):
-            cmd += ["--served-name", str(opts["served_name"])]
-        if dry_run:
-            cmd.append("--dry-run")
-
-        extra = [str(a) for a in (opts.get("extra_args") or [])]
-        if engine == "ninfer" and bool(self.cfg.root.engine.ninfer_jsonl):
-            jsonl = self.cfg.root.engine.ninfer_jsonl_path
-            jsonl_path = self.cfg.p("paths.run_dir") / Path(str(jsonl)).name
-            extra = [
-                "--request-log-jsonl", str(jsonl_path),
-                "--log-stats-interval-ms", str(int(self.cfg.root.engine.ninfer_stats_interval_ms)),
-                *extra,
-            ]
-        if extra:
-            cmd += ["--"] + extra
-
-        env = os.environ.copy()
-        env.update(
-            {
-                "HOST_PORT": str(self.engine_port),
-                "COMPAT": "0",           # the monitor gateway is the public port now
-                "RUN_DIR": str(self.run_dir),
-                "ENGINE": engine,
-            }
-        )
-        for key, value in dict(self.cfg.root.engine.extra_env or {}).items():
-            env[str(key)] = str(value)
-        env.update(self.kvcache_env())
-        if engine == "vllm" and opts.get("image"):
-            env["VLLM_IMAGE"] = str(opts["image"])
-        return cmd, env
-
     def default_profile(self, engine: str | None = None) -> str:
         """Configured default profile (config.yaml → engine.default_profile)."""
         name = (engine or self.cfg.root.engine.default or "vllm").lower()
@@ -330,18 +266,6 @@ class Controller:
             out["cpu_bytes_to_use"] = str(kv.cpu_bytes_to_use)
             out["kvoffload_dir"] = str(self.cfg.p("kvcache.disk_dir"))
         return out
-
-    def kvcache_env(self) -> dict[str, str]:
-        """Same settings as environment variables, for the run_llm.sh path."""
-        kv = self.cfg.root.kvcache
-        enabled = bool(kv.enabled)
-        env = {"KVCACHE_OFFLOAD": "1" if enabled else "0"}
-        if enabled:
-            size = launcher.parse_size(kv.cpu_bytes_to_use)
-            if size:
-                env["CPU_BYTES_TO_USE"] = str(size)
-            env["KVOFFLOAD_DIR"] = str(self.cfg.p("kvcache.disk_dir"))
-        return env
 
     def build_plan(self, opts: dict) -> LaunchPlan:
         engine = (opts.get("engine") or self.cfg.root.engine.default).lower()
@@ -395,32 +319,7 @@ class Controller:
                     "error": "a stale engine process/container exists; stop it first (or use switch)",
                     "state": self.state,
                 }
-            if self.use_launcher:
-                return await self._start_launcher(opts)
-            return await self._start_script(opts)
-
-    async def _start_script(self, opts: dict) -> dict:
-        cmd, env = self.build_command(opts)
-        if opts.get("dry_run"):
-            code, out = await self._run(cmd, env, timeout=120)
-            return {"ok": code == 0, "command": cmd, "output": out, "dry_run": True}
-        engine = opts.get("engine") or self.cfg.root.engine.default
-        self.kind = engine
-        self.rt.kvcache.apply_launch(self.kvcache_vars())
-        self.rt.engine_api_key = str(opts.get("api_key") or "") or None
-        self.start_command = cmd
-        self._set("starting", f"launching {engine}…", engine)
-        code, out = await self._run(cmd, env, timeout=600, log=True)
-        if code != 0:
-            self._set("failed", f"run_llm.sh exited {code}")
-            return {"ok": False, "error": f"run_llm.sh exited {code}", "command": cmd,
-                    "output": out[-4000:]}
-        self.last_action = {"action": "start", "engine": engine, "at": _now_iso(),
-                            "source": "run_llm.sh"}
-        deadline = time.time() + float(self.cfg.root.engine.health_timeout_s)
-        self._task = asyncio.create_task(self._await_health(deadline, None))
-        return {"ok": True, "state": self.state, "command": cmd, "output": out[-2000:],
-                "source": "run_llm.sh"}
+            return await self._start_launcher(opts)
 
     async def _start_launcher(self, opts: dict) -> dict:
         plan = await asyncio.to_thread(self.build_plan, opts)

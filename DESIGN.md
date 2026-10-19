@@ -32,7 +32,7 @@
    NInfer JSONL tail（1s，按 `x-request-id` 回填）、docker/pid 探测（2s）、日志 tail。
 3. **Controller** — 唯一写状态的地方。状态机
    `stopped → starting → healthy → stopping → failed`，全局锁，起停都通过
-   `../run_llm.sh`（不改脚本）：
+   `engines/*.yaml`（run_llm.sh 已淘汰，此处为历史记录）：
 
    ```bash
    HOST_PORT=8001 COMPAT=0 RUN_DIR=... ../run_llm.sh \
@@ -58,7 +58,9 @@
   `run_llm.sh`。启动阶段由 spec 里的 `startup:` 正则驱动（UI 显示真实进度），
   停止走 `docker stop -t 25` + `rm` / SIGTERM→SIGKILL，并等待端口释放。
 * 实测：`vllm → ninfer → vllm` 两次真实切换，NInfer ≈10s、vLLM ≈90s。
-* 剩余：观察一段时间后把 `run_llm.sh` 变成 shim，再删除。
+* 已完成：观察期结束后直接淘汰 `run_llm.sh`（2026-10-19）。argv 契约改由
+  `tests/golden/launch_argv.json` + `tests/test_launch_golden.py` 冻结，
+  对拍工具 `tools/parity.py` 随之删除。
 
 ## 4. 统一指标字典
 
@@ -229,7 +231,7 @@ uPlot 在面板隐藏时宽度为 0，所以**每次切到总览都会重建图�
 
 * `pytest` 62 项通过（Prometheus 解析、SSE 三协议、completions 翻译、docker scope 守卫、
   launcher、token 账本（区间/分日/估算）、日志截断与 DB 硬上限）。
-* `tools/parity.py` 31/31 与 `run_llm.sh` 等价。
+* `tests/test_launch_golden.py` 32/32 冻结 argv（等价于原 parity 的契约）。
 * 起停命令经 `--dry-run` 校验；契约探针 5 项 200。
 * 现有 vLLM 在 `:8000` 上被 adopt 后，`/api/state`、图表、历史、GPU 均正常。
 * 真实切换（vLLM ⇄ NInfer）需要在可以中断服务时执行，见 README FAQ。

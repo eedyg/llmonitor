@@ -11,7 +11,6 @@ import yaml
 
 DEFAULTS: dict[str, Any] = {
     "paths": {
-        "run_llm": "../run_llm.sh",
         "run_dir": "../run",
         "state_dir": "./state",
     },
@@ -30,7 +29,6 @@ DEFAULTS: dict[str, Any] = {
         "container_names": {"vllm": "vllm-qwen38", "ninfer": "ninfer-qwen38"},
         "profiles": ["stage1", "mtp", "dflash", "dflash2", "kv2", "kv3"],
         "default_ctx": {"vllm": "128k", "ninfer": "256k"},
-        "launcher": True,
         "stop_grace_s": 25,
         "health_timeout_s": 1800,
         "health_poll_s": 2.0,
@@ -154,7 +152,6 @@ _ENV_MAP = {
     "MONITOR_GATEWAY_PORT": ("server", "gateway_port"),
     "MONITOR_ENGINE_PORT": ("server", "engine_port"),
     "MONITOR_AUTH_TOKEN": ("server", "auth_token"),
-    "MONITOR_RUN_LLM": ("paths", "run_llm"),
     "MONITOR_RUN_DIR": ("paths", "run_dir"),
     "MONITOR_STATE_DIR": ("paths", "state_dir"),
     "MONITOR_DB": ("storage", "db"),
@@ -166,7 +163,6 @@ _ENV_MAP = {
     "MONITOR_FORCE_USAGE_CHUNK": ("gateway", "force_usage_chunk"),
     "MONITOR_ENGINE_DEFAULT": ("engine", "default"),
     "MONITOR_DOCKER_PULL_TIMEOUT": ("docker", "pull_timeout_s"),
-    "MONITOR_ENGINE_LAUNCHER": ("engine", "launcher"),
     "MONITOR_KVCACHE_ENABLED": ("kvcache", "enabled"),
     "MONITOR_KVCACHE_CPU": ("kvcache", "cpu_bytes_to_use"),
     "MONITOR_KVCACHE_DIR": ("kvcache", "disk_dir"),
