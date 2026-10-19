@@ -275,10 +275,15 @@ class Controller:
         if not merged.get("profile"):
             merged["profile"] = self.default_profile(engine)
         # An explicit launch option always wins over config.yaml, so the UI can
-        # override the offload layer for a single start.
-        for key, value in self.kvcache_vars().items():
-            if merged.get(key) in (None, ""):
-                merged[key] = value
+        # override the offload layer for a single start. NInfer has no KV
+        # offload at all (kv2/kv3 are vLLM-only profiles), so it must report the
+        # collector as disabled instead of inheriting config.yaml's kvcache block.
+        if engine == "vllm":
+            for key, value in self.kvcache_vars().items():
+                if merged.get(key) in (None, ""):
+                    merged[key] = value
+        else:
+            merged.setdefault("offload_enabled", "0")
         if not merged.get("ctx"):
             merged["ctx"] = dict(self.cfg.root.engine.default_ctx).get(engine, "128k")  # fallback only
         if engine == "ninfer" and bool(self.cfg.root.engine.ninfer_jsonl):
