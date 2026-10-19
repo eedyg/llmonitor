@@ -352,13 +352,15 @@ class Controller:
         await self._cleanup_before_start(plan)
         if self._port_listening(self.engine_port):
             await self._wait_port_free(self.engine_port, 90)
-        if plan.kind == "process":
-            # NInfer does not set SO_REUSEADDR: a TIME-WAIT socket on this port
-            # blocks the bind for ~60s. run_llm.sh waited for it; so do we.
-            waited = await self._wait_time_wait(self.engine_port)
-            if waited:
-                self.rt.publish({"type": "engine_state", "state": "starting",
-                                 "detail": f"waited {waited}s for TIME-WAIT on :{self.engine_port}"})
+        # Wait out TIME-WAIT on the engine port regardless of *what* we are about
+        # to start: the leftover sockets come from the engine that just stopped
+        # (NInfer never sets SO_REUSEADDR), and vLLM binding right after NInfer
+        # used to die with "OSError: [Errno 98] Address already in use" because
+        # this used to be gated on the *new* engine being a process.
+        waited = await self._wait_time_wait(self.engine_port)
+        if waited:
+            self.rt.publish({"type": "engine_state", "state": "starting",
+                             "detail": f"waited {waited}s for TIME-WAIT on :{self.engine_port}"})
         self.startup = self._new_startup(plan)
         self._set("starting", f"launching {plan.engine} · {plan.profile}…", plan.engine)
         self.rt.publish({"type": "startup", "startup": self.startup})

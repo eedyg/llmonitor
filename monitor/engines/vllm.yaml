@@ -123,6 +123,10 @@ engine_args:
   - "--max-num-batched-tokens"
   - "${max_num_batched_tokens}"
   - "--enable-prefix-caching"
+  # 每个响应要带 usage.prompt_tokens_details.cached_tokens：vLLM 默认不带，
+  # 于是 tap 记不到命中数，请求历史里「缓存」列永远是 0（源码 anthropic/serving.py
+  # 的注释确认了 "flag off → 字段省略" 的行为）。总览的命中率走 /metrics 不受影响。
+  - "--enable-prompt-tokens-details"
 
 conditional_args:
   - when: {reasoning_parser: {truthy: true}}
