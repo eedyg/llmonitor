@@ -251,3 +251,31 @@ def test_missing_cache_ratio_is_unknown_not_zero(tmp_path):
     assert scope["cache_unknown"] is True
     assert scope["cache_hit_pct"] is None
     assert scope["prompt_cached"] == 0
+
+
+def test_tiny_cache_sample_does_not_reprice_a_day(tmp_path):
+    """A post-restart sample must not rewrite a day it barely covers."""
+    from monitor.store import day_window
+
+    store = Store(tmp_path / "m.db")
+    since, until = day_window("2026-10-05", "2026-10-05")
+    for _ in range(10):
+        rec = Record(protocol=CHAT, engine="vllm", endpoint="/v1/chat/completions")
+        rec.started_at = since + 60
+        rec.status = 200
+        rec.prompt_tokens = 100_000
+        rec.content_tokens = 10
+        store.add(rec)
+    # a full-day sample from the previous day, then a 1k-token restart sample
+    store.db.execute(
+        "INSERT INTO cache_daily (day, engine, queries, hits) VALUES"
+        " ('2026-10-04','vllm',200000,200000), ('2026-10-05','vllm',1000,0)"
+    )
+    store.db.commit()
+
+    data = store.token_range(since, until)
+    day = data["daily"][0]
+    assert day["prompt"] == 1_000_000
+    # 1k of 1M is 0.1% coverage -> fall back to the all-time ratio, not 0%
+    assert day["cache_hit_pct"] > 99.0
+    assert day["prompt_cached"] == data["scope"]["prompt_cached"]

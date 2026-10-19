@@ -235,6 +235,16 @@ thinking·真实输出；再换算成 **DeepSeek-flash 等价费用** 与 **GPU 
 > 的命中率（`vllm:prompt_tokens_cached_total / vllm:prompt_tokens_total`）乘请求侧
 > prompt 总量，并打上 `≈` 与 tooltip。NInfer 走 JSONL 的
 > `prefix_cache_hit_tokens`，是精确值，不带 `≈`。
+>
+> **命中率存哪、为什么重启不变？** 引擎计数器活在引擎进程里，重启即归零；渲染时
+> 现读会让同一批历史 token 从“88% 命中”变成“0% 命中”（等价费用 6.9 元 → 34.7 元）。
+> 所以 metrics 循环每 15 s 把 `(day, engine, queries, hits)` 写进 `cache_daily`，
+> 每天取 `MAX`（计数器回绕压不低它）。读的时候：当天命中率 = 该行 `hits/queries`，
+> 全量 = 所有行 `Σhits/Σqueries`，日期区间按天 token 加权后汇总，所以明细加起来
+> 等于区间合计。**样本门槛**：某天的样本覆盖不到当天 prompt 的 10%（典型是引擎刚
+> 重启）就不采信，回落到全量比率 —— 免得 1.5 万 token 的样本给 880 万 token 的一天
+> 定价。一天结束后不再采样，那天比率就冻结；没有任何样本时标 `cache_unknown`，
+> 金额按“全部未命中”的上限显示。
 
 ### 金额：DeepSeek 等价 + GPU 电费
 

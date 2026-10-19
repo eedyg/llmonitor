@@ -81,6 +81,12 @@ CREATE TABLE IF NOT EXISTS cache_daily (
 # arrived; a 0 prompt is meaningless, hence NULLIF.
 PROMPT_EXPR = "COALESCE(NULLIF(prompt_tokens, 0), prompt_tokens_est, 0)"
 
+# A persisted cache sample is only trusted when it covers at least this share of
+# the day's prompt tokens. After an engine restart the sample can be a few
+# thousand tokens against a day that already has millions; extrapolating it
+# would misprice the whole day and make the per-day rows disagree with the total.
+CACHE_MIN_COVERAGE = 0.1
+
 TOKEN_FIELDS = f"""
        COUNT(*),
        COALESCE(SUM({PROMPT_EXPR}), 0),
@@ -524,7 +530,7 @@ class Store:
             # engine process. History must not move on a restart, so it uses the
             # persisted per-day counters and only falls back to the live figure
             # while nothing has been recorded yet.
-            history_ratio = self._ratio_of(self._cache_days()) or cache_ratio
+            history_ratio = self._cache_ratios()[0] or cache_ratio
             session = self._finish_scope(self._token_scope(self.started_at), cache_ratio)
             history = self._finish_scope(self._token_scope(None), history_ratio)
             uptime = max(0.0, now - self.started_at)
@@ -548,11 +554,10 @@ class Store:
         start_key = datetime.fromtimestamp(since).date().isoformat()
         end_key = datetime.fromtimestamp(max(since, until - 1)).date().isoformat()
         with self._lock:
-            stats = self._cache_days()
-            window = [k for k in stats if start_key <= k <= end_key]
-            # Prefer the ratio of the requested window; then any persisted day;
-            # the live engine figure is only a last resort (it resets on restart).
-            default_ratio = self._ratio_of(stats, window) or self._ratio_of(stats) or cache_ratio
+            # Token-weighted ratio for the window plus each day's own ratio, so
+            # the per-day rows add up to the window total.
+            weighted, per_day = self._cache_ratios(since, until)
+            default_ratio = weighted if weighted is not None else cache_ratio
             scope = self._finish_scope(self._token_scope(since, until), default_ratio)
             rows = self.db.execute(
                 DAILY_TOKEN_SQL.format(prompt=PROMPT_EXPR, peak=self.peak_sql),
@@ -569,8 +574,7 @@ class Store:
                 "thinking": int(row[9] or 0),
                 "content": int(row[10] or 0),
             }
-            hits, queries = stats.get(str(row[0]), (0.0, 0.0))
-            day_ratio = (hits / queries) if queries > 0 else default_ratio
+            day_ratio = per_day.get(str(row[0]), default_ratio)
             entry = self._finish_scope(raw, day_ratio)
             entry.pop("first_at", None)
             entry.pop("last_at", None)
@@ -644,6 +648,49 @@ class Store:
             hits += h
             queries += q
         return (hits / queries) if queries > 0 else None
+
+    def _prompt_by_day(self, since: float, until: float | None) -> dict[str, int]:
+        """Prompt tokens per local day in the window (caller holds the lock)."""
+        clause = ""
+        args: list[Any] = []
+        if until is not None:
+            clause = " WHERE started_at >= ? AND started_at < ?"
+            args = [since, until]
+        elif since:
+            clause = " WHERE started_at >= ?"
+            args = [since]
+        rows = self.db.execute(
+            "SELECT strftime('%Y-%m-%d', started_at, 'unixepoch', 'localtime') AS day,"
+            f" COALESCE(SUM({PROMPT_EXPR}), 0) FROM requests{clause} GROUP BY day",
+            args,
+        )
+        return {str(r[0]): int(r[1] or 0) for r in rows}
+
+    def _cache_ratios(self, since: float = 0.0,
+                      until: float | None = None) -> tuple[float | None, dict[str, float]]:
+        """Token-weighted cache-hit ratio: (whole window, per local day).
+
+        Each day's own sample is used when it covers enough of that day's prompt
+        tokens; otherwise the day falls back to the all-time ratio, so a tiny
+        post-restart sample cannot reprice a day's historical traffic. The window
+        ratio is the token-weighted mix of the day ratios, which keeps the daily
+        rows consistent with the window total. Caller holds the lock.
+        """
+        stats = self._cache_days()
+        prompts = self._prompt_by_day(since, until)
+        fallback = self._ratio_of(stats)
+        per_day: dict[str, float] = {}
+        for day, prompt in prompts.items():
+            hits, queries = stats.get(day, (0.0, 0.0))
+            if queries > 0 and queries >= CACHE_MIN_COVERAGE * max(prompt, 1):
+                per_day[day] = hits / queries
+            elif fallback is not None:
+                per_day[day] = fallback
+        total = sum(prompts.get(day, 0) for day in per_day)
+        if total <= 0:
+            return fallback, per_day
+        weighted = sum(prompts[day] * ratio for day, ratio in per_day.items()) / total
+        return weighted, per_day
 
     # -- GPU energy ---------------------------------------------------------
     def record_energy(self, power_w: Any, dt_s: float, now: float | None = None) -> None:
