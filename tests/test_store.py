@@ -181,3 +181,73 @@ def test_token_range_estimates_cache_per_day(tmp_path):
     plain = store.token_range(since, until)
     assert plain["scope"]["prompt_cached"] == 0
     assert plain["scope"]["cache_estimated"] is False
+
+
+def test_cache_ratio_is_persisted_and_survives_restart(tmp_path):
+    """A reboot zeroes the engine counters; the ledger must not move."""
+    from monitor.store import day_window
+
+    store = Store(tmp_path / "m.db")
+    now = time.time()
+    rec = Record(protocol=CHAT, engine="vllm", endpoint="/v1/chat/completions")
+    rec.started_at = now - 60
+    rec.status = 200
+    rec.prompt_tokens = 1000
+    rec.prompt_cached = None      # vLLM never fills cached_tokens per request
+    rec.content_tokens = 10
+    store.add(rec)
+
+    # what the metrics loop saw while the engine was warm: 900 of 1000 cached
+    store.record_cache("vllm", 1000, 900, now)
+    history = store.token_totals()["history"]
+    assert history["prompt_cached"] == 900
+    assert history["cache_estimated"] is True
+    assert history["cache_unknown"] is False
+
+    # engine restart: counters are back at 0, then a cold request arrives
+    store.record_cache("vllm", 0, 0, now + 1)
+    store.record_cache("vllm", 10, 0, now + 2)
+    assert store.token_totals()["history"]["prompt_cached"] == 900
+
+    data = store.token_range(*day_window(None, None))
+    assert data["scope"]["prompt_cached"] == 900
+    assert data["daily"][-1]["prompt_cached"] == 900
+
+
+def test_token_range_uses_each_day_cache_ratio(tmp_path):
+    from monitor.store import day_window
+
+    store = Store(tmp_path / "m.db")
+    since, until = day_window("2026-10-01", "2026-10-02")
+    for day in (0, 1):
+        rec = Record(protocol=CHAT, engine="vllm", endpoint="/v1/chat/completions")
+        rec.started_at = since + day * 86400 + 60
+        rec.status = 200
+        rec.prompt_tokens = 1000
+        rec.content_tokens = 10
+        store.add(rec)
+    store.db.execute(
+        "INSERT INTO cache_daily (day, engine, queries, hits) VALUES"
+        " ('2026-10-01','vllm',1000,800), ('2026-10-02','vllm',1000,200)"
+    )
+    store.db.commit()
+
+    data = store.token_range(since, until)
+    assert [d["prompt_cached"] for d in data["daily"]] == [800, 200]
+    assert data["scope"]["prompt_cached"] == 1000      # weighted, not averaged
+    assert data["scope"]["cache_estimated"] is True
+
+
+def test_missing_cache_ratio_is_unknown_not_zero(tmp_path):
+    store = Store(tmp_path / "m.db")
+    rec = Record(protocol=CHAT, engine="vllm", endpoint="/v1/chat/completions")
+    rec.started_at = time.time()
+    rec.status = 200
+    rec.prompt_tokens = 1000
+    rec.content_tokens = 10
+    store.add(rec)
+
+    scope = store.token_totals(cache_ratio=None)["history"]
+    assert scope["cache_unknown"] is True
+    assert scope["cache_hit_pct"] is None
+    assert scope["prompt_cached"] == 0

@@ -31,6 +31,7 @@ async def metrics_loop(rt: Runtime) -> None:
     static_key = (rt.cfg.root.engine.extra_env or {}).get("API_KEY")
     base = f"http://127.0.0.1:{int(rt.cfg.root.server.engine_port)}"
     last_models = 0.0
+    last_cache = 0.0
     async with httpx.AsyncClient() as client:
         while True:
             api_key = rt.engine_api_key or static_key
@@ -62,11 +63,19 @@ async def metrics_loop(rt: Runtime) -> None:
                         metrics = Metrics(rt.engine.raw_text)
                     else:
                         rt.engine.kind = kind
-                    snap = adapter.normalize(metrics, time.time())
+                    now = time.time()
+                    snap = adapter.normalize(metrics, now)
                     if rt.engine.models:
                         (snap.get("model") or {}).update(rt.engine.models)
                     rt.engine.snapshot = snap
                     rt.engine.failures = 0
+                    # Persist the cumulative prompt-cache counters (per day,
+                    # monotone) so cost estimates survive engine restarts.
+                    if now - last_cache >= 15.0:
+                        last_cache = now
+                        tokens = snap.get("tokens") or {}
+                        rt.store.record_cache(kind, tokens.get("prompt"),
+                                              tokens.get("prompt_cached"), now)
                 else:
                     rt.engine.failures += 1
                     rt.engine.snapshot["ok"] = False

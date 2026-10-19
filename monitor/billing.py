@@ -79,6 +79,7 @@ def token_cost(price: DeepSeekPrice, scope: dict) -> dict:
         "offpeak_price": round(offpeak_price, 4),  # if everything ran off-peak
         "peak_surcharge": round(cost - offpeak_price, 4),
         "peak_token_pct": round(100.0 * peak_tokens / total_tokens, 1) if total_tokens else None,
+        "cache_unknown": bool(scope.get("cache_unknown")),
     }
 
 

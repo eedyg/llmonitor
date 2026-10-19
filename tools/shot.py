@@ -76,6 +76,9 @@ async def capture(url: str, out: str, width: int, height: int, wait: float, port
                 })
                 if result.get("result", {}).get("exceptionDetails"):
                     print(f"eval error: {result['result']['exceptionDetails']}", file=sys.stderr)
+                value = result.get("result", {}).get("result", {}).get("value")
+                if value is not None:
+                    print(value)
                 await asyncio.sleep(wait)
             shot = await call("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True})
             data = shot.get("result", {}).get("data")

@@ -588,18 +588,28 @@
     set("#tok-prompt", fmtTok(s.prompt), `${fmtInt(s.prompt)} tok`);
     set("#tok-output", fmtTok(s.output), `${fmtInt(s.output)} tok`);
 
-    const inPct = pct(s.prompt_cached, s.prompt);
+    const cacheUnknown = s.cache_unknown === true;
+    const inPct = cacheUnknown ? null : pct(s.prompt_cached, s.prompt);
     const hitBar = $("#tok-in-hit-bar");
     const missBar = $("#tok-in-miss-bar");
     if (hitBar && missBar) {
       hitBar.style.width = inPct == null ? "0%" : `${inPct}%`;
       missBar.style.width = inPct == null ? "0%" : `${100 - inPct}%`;
     }
-    set("#tok-in-hit", `${approx}${fmtInt(s.prompt_cached)}`,
+    // Say where the estimated ratio comes from: the engine counters reset on
+    // every engine restart, so a small sample can look like a cache regression.
+    const engCache = (snap.engine || {}).cache || {};
+    const sample = Number(engCache.prefix_queries || 0);
+    const estNote = sample > 0
+      ? `按引擎侧命中率估算（本引擎进程 ${fmtInt(sample)} tok，命中 ${fmt(100 * (engCache.hit_rate || 0), 1)}%）`
+      : "vLLM 响应里没有 cached_tokens，按引擎侧命中率估算";
+    set("#tok-in-hit", cacheUnknown ? "未知" : `${approx}${fmtInt(s.prompt_cached)}`,
         s.cache_estimated
-          ? "vLLM 响应里没有 cached_tokens，按引擎侧命中率估算"
-          : `${fmtInt(s.prompt_cached)} tok`);
-    set("#tok-in-miss", `${approx}${fmtInt(s.prompt_miss)}`);
+          ? estNote
+          : cacheUnknown
+            ? "引擎没报告 cached_tokens，也没有留存命中率 → 金额按全部未命中估算（上限）"
+            : `${fmtInt(s.prompt_cached)} tok`);
+    set("#tok-in-miss", cacheUnknown ? "未知" : `${approx}${fmtInt(s.prompt_miss)}`);
     set("#tok-in-hit-pct", pctText(inPct));
     set("#tok-in-miss-pct", inPct == null ? "" : pctText(100 - inPct));
 
@@ -652,10 +662,11 @@
     const peakPct = ds.peak_token_pct;
     set("#tok-cost-ds", fmtMoney(ds.cost),
         `${price.model || "deepseek"} 价目：命中 ${price.per_million?.cache_hit} / 未命中 ${price.per_million?.cache_miss} / 输出 ${price.per_million?.output} 元每百万 token（高峰价，空闲半价）`);
+    const peakText = peakPct == null
+      ? "无 token"
+      : `高峰时段 ${fmt(peakPct, 1)}% · 全高峰价 ${fmtMoney(ds.peak_price)}`;
     set("#tok-cost-ds-sub",
-        peakPct == null
-          ? "无 token"
-          : `高峰时段 ${fmt(peakPct, 1)}% · 全高峰价 ${fmtMoney(ds.peak_price)}`,
+        ds.cache_unknown ? `按全部未命中估算（上限）· ${peakText}` : peakText,
         `高峰时段多花 ${fmtMoney(ds.peak_surcharge)}；全在空闲时段 ${fmtMoney(ds.offpeak_price)}`);
     set("#tok-cost-power", fmtMoney(energy.cost),
         `GPU 功耗积分得到的电量 × ${price.cny_per_kwh ?? "?"} 元/kWh`);
@@ -685,7 +696,7 @@
     thead.append(head);
     const body = el("tbody");
     for (const day of range.daily) {
-      const mark = day.cache_estimated ? "≈" : "";
+      const mark = day.cache_estimated ? "≈" : (day.cache_unknown ? "?" : "");
       const tr = el("tr");
       tr.append(el("td", "mono", day.date));
       tr.append(el("td", null, fmtInt(day.requests)));

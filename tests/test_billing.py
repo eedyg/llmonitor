@@ -144,3 +144,10 @@ def test_snapshot_report_shape(tmp_path):
     for key in ("session", "history"):
         assert set(report[key]) == {"deepseek", "energy", "total"}
     assert report["history"]["total"] == 0
+
+
+def test_unknown_cache_ratio_is_flagged_in_the_cost():
+    price = billing.DeepSeekPrice(cache_hit=0.04, cache_miss=2.0, output=8.0)
+    cost = billing.token_cost(price, {"prompt_miss": 1_000_000, "cache_unknown": True})
+    assert cost["cache_unknown"] is True
+    assert cost["cost"] == pytest.approx(1.0)          # upper bound, off-peak

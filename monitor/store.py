@@ -9,7 +9,7 @@ import time
 from collections import deque
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS requests (
@@ -66,6 +66,14 @@ CREATE TABLE IF NOT EXISTS gpu_energy (
     day TEXT PRIMARY KEY,          -- local calendar day, YYYY-MM-DD
     wh REAL NOT NULL DEFAULT 0,    -- integrated GPU power
     seconds REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS cache_daily (
+    day TEXT NOT NULL,             -- local calendar day, YYYY-MM-DD
+    engine TEXT NOT NULL,
+    queries INTEGER NOT NULL DEFAULT 0,  -- prompt tokens processed
+    hits INTEGER NOT NULL DEFAULT 0,     -- of those, served from prefix cache
+    updated REAL,
+    PRIMARY KEY (day, engine)
 );
 """
 
@@ -455,11 +463,18 @@ class Store:
         peak_thinking = int(peak.get("thinking") or 0)
         peak_content = int(peak.get("content") or 0)
         estimated = False
-        if not raw["cached_rows"] and cache_ratio and prompt:
-            cached = min(prompt, int(round(prompt * cache_ratio)))
-            # same ratio for the peak subset: the engine only knows a global one
-            peak_cached = min(peak_prompt, int(round(peak_prompt * cache_ratio)))
-            estimated = True
+        unknown = False
+        if not raw["cached_rows"] and prompt:
+            if cache_ratio:
+                cached = min(prompt, int(round(prompt * cache_ratio)))
+                # same ratio for the peak subset: the engine only knows a global one
+                peak_cached = min(peak_prompt, int(round(peak_prompt * cache_ratio)))
+                estimated = True
+            else:
+                # No ratio at all: the rows never carried cached_tokens and no
+                # engine counter was persisted. Do not claim a 0% hit rate —
+                # the cost we show is then an upper bound, flagged as unknown.
+                unknown = cache_ratio is None
         output = thinking + content
         peak_output = peak_thinking + peak_content
         return {
@@ -471,8 +486,9 @@ class Store:
             "output": output,
             "thinking": thinking,
             "content": content,
-            "cache_hit_pct": round(100.0 * cached / prompt, 1) if prompt else None,
+            "cache_hit_pct": None if unknown or not prompt else round(100.0 * cached / prompt, 1),
             "cache_estimated": estimated,
+            "cache_unknown": unknown,
             "first_at": raw.get("first_at"),
             "last_at": raw.get("last_at"),
             "peak": {
@@ -504,8 +520,13 @@ class Store:
             hit = self._tokens_cache
             if hit and now - hit["at"] < cache_s and hit["ratio"] == cache_ratio:
                 return hit["data"]
+            # ``cache_ratio`` is the live engine counter, which resets with the
+            # engine process. History must not move on a restart, so it uses the
+            # persisted per-day counters and only falls back to the live figure
+            # while nothing has been recorded yet.
+            history_ratio = self._ratio_of(self._cache_days()) or cache_ratio
             session = self._finish_scope(self._token_scope(self.started_at), cache_ratio)
-            history = self._finish_scope(self._token_scope(None), cache_ratio)
+            history = self._finish_scope(self._token_scope(None), history_ratio)
             uptime = max(0.0, now - self.started_at)
             session["uptime_s"] = round(uptime, 1)
             session["tps"] = round(session["total"] / uptime, 2) if uptime > 0.5 else None
@@ -524,8 +545,15 @@ class Store:
         Used by the date-range picker: one aggregate for the whole window plus
         one row per calendar day (zero-filled, so a quiet day still shows up).
         """
+        start_key = datetime.fromtimestamp(since).date().isoformat()
+        end_key = datetime.fromtimestamp(max(since, until - 1)).date().isoformat()
         with self._lock:
-            scope = self._finish_scope(self._token_scope(since, until), cache_ratio)
+            stats = self._cache_days()
+            window = [k for k in stats if start_key <= k <= end_key]
+            # Prefer the ratio of the requested window; then any persisted day;
+            # the live engine figure is only a last resort (it resets on restart).
+            default_ratio = self._ratio_of(stats, window) or self._ratio_of(stats) or cache_ratio
+            scope = self._finish_scope(self._token_scope(since, until), default_ratio)
             rows = self.db.execute(
                 DAILY_TOKEN_SQL.format(prompt=PROMPT_EXPR, peak=self.peak_sql),
                 (since, until),
@@ -541,7 +569,9 @@ class Store:
                 "thinking": int(row[9] or 0),
                 "content": int(row[10] or 0),
             }
-            entry = self._finish_scope(raw, cache_ratio)
+            hits, queries = stats.get(str(row[0]), (0.0, 0.0))
+            day_ratio = (hits / queries) if queries > 0 else default_ratio
+            entry = self._finish_scope(raw, day_ratio)
             entry.pop("first_at", None)
             entry.pop("last_at", None)
             entry["date"] = row[0]
@@ -561,6 +591,59 @@ class Store:
             daily.append(entry)
             cursor += timedelta(days=1)
         return {"scope": scope, "daily": daily}
+
+    # -- prompt cache hit ratio (persisted) ---------------------------------
+    def record_cache(self, engine: str | None, queries: Any, hits: Any,
+                     now: float | None = None) -> None:
+        """Persist the engine's cumulative prompt-cache counters, per local day.
+
+        The counters live in the engine process and drop back to zero on every
+        restart, so reading them at render time made the *historical* cache-hit
+        estimate — and with it the DeepSeek equivalent cost — jump after a
+        reboot. We keep the largest value seen per day instead, which makes the
+        ratio monotone and restart-proof.
+        """
+        try:
+            q = int(queries or 0)
+            h = int(hits or 0)
+        except (TypeError, ValueError):
+            return
+        if q <= 0:
+            return
+        h = max(0, min(h, q))
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO cache_daily (day, engine, queries, hits, updated)"
+                " VALUES (?,?,?,?,?)"
+                " ON CONFLICT(day, engine) DO UPDATE SET"
+                "   queries = MAX(queries, excluded.queries),"
+                "   hits = MAX(hits, excluded.hits),"
+                "   updated = excluded.updated",
+                (date.today().isoformat(), engine or "?", q, h,
+                 now if now is not None else time.time()),
+            )
+            self.db.commit()
+            self._tokens_cache = None
+
+    def _cache_days(self) -> dict[str, tuple[float, float]]:
+        """day -> (hits, queries) from the persisted counters (lock held)."""
+        out: dict[str, tuple[float, float]] = {}
+        for row in self.db.execute(
+            "SELECT day, COALESCE(SUM(hits), 0), COALESCE(SUM(queries), 0)"
+            " FROM cache_daily GROUP BY day"
+        ):
+            out[str(row[0])] = (float(row[1] or 0), float(row[2] or 0))
+        return out
+
+    @staticmethod
+    def _ratio_of(days: dict[str, tuple[float, float]],
+                  keys: Iterable[str] | None = None) -> float | None:
+        hits = queries = 0.0
+        for key in (days.keys() if keys is None else keys):
+            h, q = days.get(key, (0.0, 0.0))
+            hits += h
+            queries += q
+        return (hits / queries) if queries > 0 else None
 
     # -- GPU energy ---------------------------------------------------------
     def record_energy(self, power_w: Any, dt_s: float, now: float | None = None) -> None:
