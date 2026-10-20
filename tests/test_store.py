@@ -1,5 +1,7 @@
 import time
 
+import pytest
+
 from monitor.store import Store
 from monitor.tap import CHAT, Record
 
@@ -351,3 +353,38 @@ def test_full_per_request_cache_coverage_wins():
     assert out["prompt_cached"] == 61_000
     assert out["cache_estimated"] is False
     assert out["cache_hit_pct"] == 61.0
+
+
+def test_partial_coverage_window_is_not_diluted():
+    """10-20 的真实回归：51% 覆盖率把 95% 的命中算成了 48.5%。
+
+    规则必须是「引擎比率 / 抽样外推」，绝不能用「部分和 ÷ 全量 prompt」。
+    """
+    from monitor.store import Store
+
+    raw = {
+        "requests": 2000,
+        "prompt": 273_224_384,
+        "prompt_cached": 132_637_448,     # 只覆盖前 51% 的 prompt
+        "cached_rows": 1093,
+        "prompt_with_cached": 139_700_000,
+        "thinking": 0, "content": 0, "peak": {},
+    }
+    out = Store._finish_scope(raw, cache_ratio=0.872)
+    assert out["cache_hit_pct"] == pytest.approx(87.2, abs=0.1)   # 不是 48.5
+    assert out["cache_estimated"] is True
+
+
+def test_partial_coverage_extrapolates_from_the_sample_without_an_engine_ratio():
+    """没有引擎计数器时，用覆盖率内的真值当样本外推，而不是把部分和当全量。"""
+    from monitor.store import Store
+
+    raw = {
+        "requests": 10, "prompt": 1_000,
+        "prompt_cached": 300, "cached_rows": 4, "prompt_with_cached": 400,
+        "thinking": 0, "content": 0, "peak": {},
+    }
+    out = Store._finish_scope(raw, cache_ratio=None)
+    assert out["prompt_cached"] == 750       # 300/400 = 75% × 1000
+    assert out["cache_estimated"] is True
+    assert out["cache_unknown"] is False

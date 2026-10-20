@@ -112,7 +112,9 @@ TOKEN_FIELDS = f"""
 # per-request cached_tokens only exist for rows written after vLLM started
 # returning them (--enable-prompt-tokens-details, 2026-10-20). Using that partial
 # sum for a whole day silently turned a 77 % day into 2.9 %.
-PER_REQUEST_CACHE_MIN_COVERAGE = 0.5
+# 逐请求 cached_tokens 要覆盖到这个比例才当作精确值；否则只能当样本或
+# 退回引擎计数器。低于此值绝不能用「部分和 ÷ 全量」的算法。
+PER_REQUEST_CACHE_FULL_COVERAGE = 0.9
 
 TOKEN_SQL = "SELECT" + TOKEN_FIELDS + "\n  FROM requests"
 
@@ -487,26 +489,38 @@ class Store:
         peak_cached = min(int(peak.get("prompt_cached") or 0), peak_prompt)
         peak_thinking = int(peak.get("thinking") or 0)
         peak_content = int(peak.get("content") or 0)
-        estimated = False
-        unknown = False
+        # ── 命中率口径：优先级 逐请求真值 > 引擎计数器 > 逐请求抽样外推 ──────────
+        #
+        # 三次踩坑都出在这一处，所以规则写成显式的三分支：
+        #   1) 逐请求值覆盖了 ≥90% 的 prompt → 直接用真值（最准）
+        #   2) 否则若引擎计数器有该窗口的比率 → 用它（它覆盖**全部**引擎流量，
+        #      不依赖 tap 是否记到）；这是 10-18/10-19 那几天的口径
+        #   3) 再否则若有一部分逐请求值 → 用它当**样本**外推
+        #      （cached/prompt_with_cached × prompt），而不是拿部分和当全量
+        #
+        # 关键教训：绝不能用「部分覆盖的和 ÷ 全量 prompt」。那样算出来会被
+        # 覆盖率直接稀释 —— 51% 覆盖率 + 95% 真实命中 → 显示 48.5%。
         prompt_with_cached = int(raw.get("prompt_with_cached") or 0)
         coverage = (prompt_with_cached / prompt) if prompt else 0.0
-        # Trust the per-request numbers only when they cover most of the window.
-        # Partial coverage (e.g. a day that mixes pre- and post-flag rows) must
-        # fall back to the engine's cumulative counters, otherwise the partial
-        # sum masquerades as "the day only had 3 % cache hits".
-        rows_usable = bool(raw["cached_rows"]) and coverage >= PER_REQUEST_CACHE_MIN_COVERAGE
-        if not rows_usable and prompt:
-            if cache_ratio:
-                cached = min(prompt, int(round(prompt * cache_ratio)))
-                # same ratio for the peak subset: the engine only knows a global one
-                peak_cached = min(peak_prompt, int(round(peak_prompt * cache_ratio)))
+        estimated = False
+        unknown = False
+        ratio_used: float | None = None
+        if prompt:
+            if raw["cached_rows"] and coverage >= PER_REQUEST_CACHE_FULL_COVERAGE:
+                cached = min(prompt, int(raw["prompt_cached"]))
+            elif cache_ratio:
+                ratio_used = float(cache_ratio)
+                cached = min(prompt, int(round(prompt * ratio_used)))
+                estimated = True
+            elif prompt_with_cached:
+                ratio_used = int(raw["prompt_cached"]) / prompt_with_cached
+                cached = min(prompt, int(round(prompt * ratio_used)))
                 estimated = True
             else:
-                # No ratio at all: the rows never carried cached_tokens and no
-                # engine counter was persisted. Do not claim a 0% hit rate —
-                # the cost we show is then an upper bound, flagged as unknown.
-                unknown = cache_ratio is None
+                cached = 0
+                unknown = True
+            if ratio_used is not None:
+                peak_cached = min(peak_prompt, int(round(peak_prompt * ratio_used)))
         output = thinking + content
         peak_output = peak_thinking + peak_content
         return {
