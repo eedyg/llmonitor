@@ -300,6 +300,7 @@ class KvCacheMonitor:
     device: str = ""
     interval_s: float = 30.0
     health_interval_s: float = 120.0
+    reclaim_target_ratio: float = 0.85
     window_s: float = 90.0
     snapshot: dict = field(default_factory=blank)
     _rates: Rates = field(default=None)  # type: ignore[assignment]
@@ -472,7 +473,7 @@ class KvCacheMonitor:
             return 0
         return total
 
-    def reclaim(self, now: float, target_ratio: float = 0.9,
+    def reclaim(self, now: float, target_ratio: float | None = None,
                 limit_bytes: int | None = None) -> dict:
         """Delete the oldest block files until usage is back under the limit.
 
@@ -483,7 +484,9 @@ class KvCacheMonitor:
         of silently doing nothing.
         """
         limit = int(limit_bytes if limit_bytes is not None else self.disk_limit_bytes)
-        target = int(limit * target_ratio)
+        ratio = self.reclaim_target_ratio if target_ratio is None else target_ratio
+        ratio = min(max(ratio, 0.5), 0.95)
+        target = int(limit * ratio)
         used, files = dir_usage(self.directory)
         victims: list[tuple[str, int]] = []
         projected = used

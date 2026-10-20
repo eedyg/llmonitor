@@ -44,6 +44,7 @@ class Runtime:
             device=str(kv.device or ""),
             interval_s=float(kv.collect_interval_s),
             health_interval_s=float(kv.health_interval_s),
+            reclaim_target_ratio=float(kv.reclaim_target_ratio),
         )
         self.taps = TapRegistry()
         self.controller: Any = None

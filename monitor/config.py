@@ -91,6 +91,7 @@ DEFAULTS: dict[str, Any] = {
         "disk_dir": "/mnt/kvcache/kvoffload",
         "disk_limit_gb": 0,
         "eviction_policy": "arc",
+        "reclaim_target_ratio": 0.85,
         "collect_interval_s": 30.0,
         "health_interval_s": 120.0,
         "device": "",

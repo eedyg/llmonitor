@@ -90,6 +90,9 @@ kvcache:
   # 显式值会被「分区容量 − 保留区」钳制，所以写 200 也不会突破安全线。
   disk_limit_gb: 0
   eviction_policy: "arc"        # CPU 主层驱逐策略：lru / arc
+  # 回收目标水位：触发后裁到这里（占生效上限的比例）。0.85 → 稳态在 143–168 GiB
+  # 之间震荡，分区常驻 9–34 GiB 余量。调高省空间、调低留余量。
+  reclaim_target_ratio: 0.85
   # 容量与 IO 采集频率（低频即可，磁盘遍历有成本）
   collect_interval_s: 30
   # NVMe SMART 健康采集频率（低频）
