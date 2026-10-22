@@ -75,7 +75,7 @@ curl -X POST localhost:9000/api/engine/start \
 | 9000 | 控制面：网页 + REST + WebSocket | 人 / 自动化脚本 |
 | 8000 | 数据面：OpenAI / Anthropic 兼容网关 | 所有 LLM 客户端 |
 | 8001 | 当前引擎（仅 127.0.0.1） | monitor 内部 |
-| 9001 | 可选：MCP streamable-http | agent |
+| 9000/mcp | MCP（streamable HTTP，**与 UI 同端口**） | agent |
 
 客户端只认 `:8000`，切换引擎对客户端完全透明（契约：同一 model 名、同一
 协议、同一路径）。
@@ -93,6 +93,20 @@ curl -X POST localhost:9000/api/engine/start \
 
 参数由 spec 的 `options:` 声明（`key` 就是 launcher 变量名），UI 通过
 `GET /api/engines` 拿到字段定义、通过 `POST /api/engine/plan` 预览；加字段不需要改前端。
+
+**模型选择**：`options` 里的 `model_dir_name` 是个下拉框，选项由 **磁盘上真实存在的**
+`models/*/config.json` 目录填出（`launcher.model_dirs`）。只认带了 `*.safetensors` 的目录，
+带 `*.aria2`/`*.part` 的（正在下载）和 GGUF-only 目录不会出现在列表里，免得启动一个写了一半的
+checkpoint。默认值仍是 `engines/vllm.yaml → models.dir_name`；命令行覆盖：
+
+```bash
+curl -X POST localhost:9000/api/engine/start -H 'content-type: application/json' \
+  -d '{"engine":"vllm","profile":"stage1","ctx":"256k","model_dir_name":"Qwen3.8-27B-NVFP4"}'
+```
+
+换模型时记得看 **MTP 层**：`--speculative-config` 的 `mtp` profile 需要模型目录里有 MTP 权重
+（官方用 `mtp.safetensors`，RedHatAI 的 NVFP4 用 `model_mtp.safetensors` 并在 index 里登记），
+没有就只能用 `stage1`。
 
 * `monitor/engines/vllm.yaml` / `ninfer.yaml`：profiles、mounts、env、条件参数、preflight 规则、**启动阶段正则**
 * `monitor/launcher.py`：`resolve(engine, opts, env) -> LaunchPlan{argv, mounts, env, labels, warnings, errors}`
@@ -307,18 +321,60 @@ Tab 上有状态提示：请求 tab 显示在飞数量徽标，引擎 tab 的小
 
 `/metrics` 可以直接给 Grafana 刮；命名统一，不区分引擎。
 
+### 非流式请求：也能看见、也能中止
+
+网关默认把客户端的 `stream:false` 改写成**上游流式**（`gateway.upstream_stream: true`），
+流结束后再聚合回一个标准 `chat.completion`，客户端完全无感。目的有两个：
+
+* **可见**：tap 能拿到逐 token 进度，UI 不再把一条思考死循环显示成「queued / 0 token」
+  （实测藏了 26 分钟、10 万+ token）；
+* **可中止**：关掉上游 SSE，vLLM 在输出生成器被关闭时会 abort 该请求
+  （这版 vLLM 的 chat 路由没挂 `with_cancellation`，非流式请求在引擎里是黑盒，
+  断客户端连接毫无作用）。
+
+```bash
+curl -X POST localhost:9000/api/requests/<mreq_id>/cancel   # UI：在飞卡片上的「取消」
+```
+
+只有 `n>1`、`logprobs` 的请求走老路（不可中止，API 会返回 409 明说）。另两个兑底：
+
+| 配置 | 默认 | 作用 |
+|---|---|---|
+| `gateway.default_max_tokens` | `0` | 给没带 `max_tokens` 的请求注入上限（0=不注入） |
+| `gateway.watchdog.enabled` | `false` | 自动中止跑飞的请求 |
+| `gateway.watchdog.max_generated_tokens` | `0` | 生成超过多少 token 就掐（0=不按 token） |
+| `gateway.watchdog.max_wall_s` | `0` | 超过多少秒就掐（0=不按墙钟） |
+
 ## MCP
 
-独立的 MCP server（`monitor/mcp_server.py`），**24 个工具**，全部是对 `:9000` 控制面的
+MCP 就在主进程里（`monitor/mcp_server.py`），**和 UI 共用 `:9000`**：端点是
+`http://127.0.0.1:9000/mcp`（streamable HTTP，stateless），不额外起进程、不额外占端口，
+UI 的 `auth_token` 中间件同样覆盖 `/mcp`。**25 个工具**，全部是对 `:9000` 控制面的
 薄封装：观测、验证、起停/切换引擎、压测、以及限定 scope 的 docker 操作。写操作两段式
 （不带 `confirm=true` 只回预览）。
 
 完整文档（每个工具的参数/返回、客户端注册、典型工作流、已知边界）见 **[MCP.md](MCP.md)**。
 
 ```bash
-../.venv/bin/python -m monitor.mcp_server                        # stdio
-../.venv/bin/python -m monitor.mcp_server --transport http --port 9001   # /mcp
+./run.sh                                                  # 起来就有 :9000/mcp
+./run.sh mcp                                              # 可选：独立 stdio 进程
+../.venv/bin/python -m monitor.mcp_server --transport http --port 9010   # 可选：独立 HTTP
 ```
+
+```json
+{
+  "mcpServers": {
+    "llm-monitor": {
+      "url": "http://127.0.0.1:9000/mcp"
+    }
+  }
+}
+```
+
+> 配了 `server.auth_token` 时加 `"headers": {"x-monitor-token": "<token>"}`；
+> 独立 HTTP 模式别用 9001（本机被 hindsight 占用）。
+
+只会拉子进程的客户端用 stdio：
 
 ```json
 {
@@ -337,7 +393,7 @@ Tab 上有状态提示：请求 tab 显示在飞数量徽标，引擎 tab 的小
 · **验证** `llm_probe` `llm_dry_run` · **生命周期** `llm_start` `llm_stop` `llm_restart`
 `llm_switch` · **压测** `llm_bench` · **Docker** `llm_docker_status` `llm_docker_pull`
 `llm_docker_job` `llm_docker_remove_image` `llm_docker_remove_container` `llm_docker_prune`
-`llm_docker_restart_with`
+`llm_docker_restart_with` · **中止** `llm_cancel_request`
 
 ## 逐请求数据从哪来
 

@@ -41,6 +41,20 @@ DEFAULTS: dict[str, Any] = {
         "force_usage_chunk": False,
         "max_capture_bytes": 8 * 1024 * 1024,
         "connect_timeout_s": 10,
+        # Ask the engine for a stream even when the client asked for one JSON
+        # body: per-token visibility, and the only way to abort a runaway
+        # generation (see monitor/assemble.py + monitor/inflight.py).
+        "upstream_stream": True,
+        # Injected as max_tokens when a chat request carries none (0 = never).
+        # A thinking loop otherwise generates until it hits the context limit.
+        "default_max_tokens": 0,
+        # Abort requests that run away. Policy, not observation: off by default.
+        "watchdog": {
+            "enabled": False,
+            "max_generated_tokens": 0,
+            "max_wall_s": 0,
+            "check_interval_s": 5.0,
+        },
     },
     "collect": {
         "metrics_interval_s": 2.0,
@@ -162,6 +176,9 @@ _ENV_MAP = {
     "MONITOR_JSONL_MAX_MB": ("logs", "jsonl_max_mb"),
     "MONITOR_KWH_PRICE": ("billing", "electricity", "cny_per_kwh"),
     "MONITOR_FORCE_USAGE_CHUNK": ("gateway", "force_usage_chunk"),
+    "MONITOR_GATEWAY_UPSTREAM_STREAM": ("gateway", "upstream_stream"),
+    "MONITOR_GATEWAY_DEFAULT_MAX_TOKENS": ("gateway", "default_max_tokens"),
+    "MONITOR_GATEWAY_WATCHDOG_ENABLED": ("gateway", "watchdog", "enabled"),
     "MONITOR_ENGINE_DEFAULT": ("engine", "default"),
     "MONITOR_DOCKER_PULL_TIMEOUT": ("docker", "pull_timeout_s"),
     "MONITOR_KVCACHE_ENABLED": ("kvcache", "enabled"),

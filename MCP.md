@@ -3,15 +3,15 @@
 把 llm-monitor 的控制面打包成 **MCP（Model Context Protocol）** 服务，让 Claude Desktop /
 Cursor / Claude Code / 自研 agent 直接"用嘴"起停引擎、切 profile、看吞吐、查每个请求、拉镜像。
 
-一句话：**24 个工具，全部是对 `:9000` HTTP 控制面的薄封装**——MCP 进程自己不碰 docker、
+一句话：**25 个工具，全部是对 `:9000` HTTP 控制面的薄封装**——MCP 进程自己不碰 docker、
 不碰引擎、不读数据库，只发 REST 请求。所以网页上能做的，MCP 都能做；网页上没有的，MCP 也没有。
 
 ```
-┌────────────┐  MCP (stdio / http / sse)  ┌──────────────────┐  HTTP  ┌─────────────────────┐
-│ Claude /   │ ─────────────────────────▶ │ monitor.mcp_server│ ─────▶ │ :9000 control API   │
-│ Cursor /   │ ◀───────────────────────── │  (24 tools)       │ ◀───── │ Controller / Store  │
-│ 自研 agent │        JSON 结果            └──────────────────┘        └──────────┬──────────┘
-└────────────┘                                                                  │
+┌────────────┐  MCP (http /mcp · stdio) ┌───────────────────────────┐  HTTP  ┌────────────────────┐
+│ Claude /   │ ────────────────────────▶ │ monitor 主进程 :9000       │ ─────▶ │ Controller / Store │
+│ Cursor /   │ ◀──────────────────────── │  UI · REST · WS · MCP     │ ◀───── │                    │
+│ 自研 agent │        JSON 结果           └───────────────────────────┘        └─────────┬──────────┘
+└────────────┘                                                                      │
                                                                     docker / pid / :8001 engine
 ```
 
@@ -19,20 +19,45 @@ Cursor / Claude Code / 自研 agent 直接"用嘴"起停引擎、切 profile、�
 
 ## 1. 启动
 
+MCP 端点由 monitor 主进程直接提供，**和 UI 同一个端口**，不用另起服务、不用另占端口：
+
 ```bash
 cd /home/eedy/workspace/llm/monitor
+./run.sh
+#   endpoint: http://127.0.0.1:9000/mcp    （streamable HTTP，stateless）
+```
 
-# stdio（默认，给桌面客户端用）
+客户端注册（Claude Desktop / Cursor / pi …）：
+
+```json
+{"mcpServers": {"llm-monitor": {"url": "http://127.0.0.1:9000/mcp"}}}
+```
+
+配了 `server.auth_token` 时带同一个 token（UI 的中间件同样管 `/mcp`）：
+
+```json
+{
+  "mcpServers": {
+    "llm-monitor": {
+      "url": "http://127.0.0.1:9000/mcp",
+      "headers": {"x-monitor-token": "<token>"}
+    }
+  }
+}
+```
+
+两种可选的独立模式（客户端只会拉子进程，或 MCP 必须单独跑在别的机器/端口时）：
+
+```bash
+# stdio（也可以 ./run.sh mcp）
 ../.venv/bin/python -m monitor.mcp_server
 
-# 也可以 ./run.sh mcp
-
-# 常驻 HTTP（给不能拉子进程的客户端 / 多客户端共用）
-../.venv/bin/python -m monitor.mcp_server --transport http --host 127.0.0.1 --port 9001
-#   endpoint: http://127.0.0.1:9001/mcp
+# 常驻 HTTP（注意：本机 9001 已被 hindsight 容器占用，换个空闲端口）
+../.venv/bin/python -m monitor.mcp_server --transport http --host 127.0.0.1 --port 9010
+#   endpoint: http://127.0.0.1:9010/mcp
 
 # 旧版 SSE 传输
-../.venv/bin/python -m monitor.mcp_server --transport sse --port 9001
+../.venv/bin/python -m monitor.mcp_server --transport sse --port 9010
 ```
 
 | 参数 | 默认 | 说明 |
@@ -40,9 +65,11 @@ cd /home/eedy/workspace/llm/monitor
 | `--url` | `http://127.0.0.1:9000` | 控制面地址（env `MONITOR_URL`） |
 | `--token` | `""` | 控制面 `server.auth_token`（env `MONITOR_TOKEN`，作为 `x-monitor-token` 头发送） |
 | `--transport` | `stdio` | `stdio` / `http`（streamable-http，路径 `/mcp`）/ `sse` |
-| `--host` / `--port` | `127.0.0.1` / `9001` | 仅 http/sse 用 |
+| `--host` / `--port` | `127.0.0.1` / `9001` | 仅独立 http/sse 用（本机 9001 被 hindsight 占用，建议 `9010`） |
 
 前提：**monitor 主进程在跑**（`./run.sh`）。MCP 只是客户端，API 不在就报连接错误。
+挂载在 UI 上的 `/mcp` 是 **stateless** 的：工具都是纯 REST 调用，不存会话，主进程重启后
+客户端直接重连即可（不需要重新握手拿 session id）。
 
 ### 客户端注册
 
@@ -104,7 +131,7 @@ claude mcp add llm-monitor -- \
 | `llm_ledger` | R | Token 累计账本（本次运行 / 库内 / 日期区间按天） |
 | `llm_cost` | R | DeepSeek-flash 等价费用 + GPU 电费 |
 | `llm_gpu` | R | GPU 遥测 + 每进程显存 |
-| `llm_live_requests` | R | 在飞请求 |
+| `llm_live_requests` | R | 在飞请求（含 `cancellable`：能否中止） |
 | `llm_requests` | R | 请求历史（元数据） |
 | `llm_request` | R | 单条请求全文 |
 | `llm_series` | R | 1 Hz 时间序列 |
@@ -113,6 +140,7 @@ claude mcp add llm-monitor -- \
 | `llm_dry_run` | R | 只算不改：启动计划/argv |
 | `llm_start` | W | 起引擎（vllm/ninfer + profile） |
 | `llm_stop` | W | 停引擎 |
+| `llm_cancel_request` | W | 中止**一个**在飞请求（关闭上游流，引擎 abort） |
 | `llm_restart` | W | 重建（换 profile/ctx） |
 | `llm_switch` | W | 原子切换引擎（停→等显存→起→健康检查） |
 | `llm_bench` | R\* | 真打一条流式请求，量 TTFT/decode（\*会产生真实推理开销） |
@@ -351,6 +379,10 @@ llm_series(window_s=600)                # 同期的吞吐/延迟曲线
   是引擎比例估算（`cache_estimated=true`），电费只算显卡。
 * **历史正文只留最近 200 条**，30 天后连元数据一起清（`storage.*`）；`llm_request` 对老记录
   的 `thinking_text` / `content_text` 会是 `null`。
+* **中止的边界**：`llm_cancel_request` 靠关掉上游 SSE 让引擎 abort。网关默认把客户端的
+  `stream:false` 改写成上游流式（`gateway.upstream_stream`），所以普通 chat 请求都能中止；
+  但 `n>1` / `logprobs` 的请求、以及旧式 `/v1/completions` 非流式请求走缓冲路径，
+  **引擎已自己吞完整条生成，任何手段都停不下来**——API 会返回 409 并写明原因。
 * 工具列表变了需要**重启 MCP server**（客户端缓存 `tools/list`）。
 
 ---

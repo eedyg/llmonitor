@@ -11,6 +11,7 @@ from .billing import snapshot_report
 from .config import Config
 from .docker_scope import Docker, Scope
 from .engine import EngineStore
+from .inflight import InflightRegistry
 from .kvcache import KvCacheMonitor, parse_size as parse_kv_size
 from .nvml import GpuCollector
 from .store import Store
@@ -51,6 +52,8 @@ class Runtime:
         self.subscribers: set[asyncio.Queue] = set()
         self.started_at = time.time()
         self.gateway = {"requests": 0, "in_flight": 0, "errors": 0, "bytes_in": 0, "bytes_out": 0}
+        # Live handles for /api/requests/{id}/cancel (see inflight.py).
+        self.inflight = InflightRegistry()
         self.events: deque[dict] = deque(maxlen=300)
         self.jsonl_offset = 0
         containers = list(cfg.root.docker.containers or [])
@@ -121,6 +124,20 @@ class Runtime:
         self.store.push_sample(self.make_point())
 
     # -- snapshot -----------------------------------------------------------
+    def live_requests(self) -> list[dict]:
+        """In-flight rows, annotated with whether they can be aborted.
+
+        The UI is WebSocket-driven (snapshot → live), so this flag has to ride
+        along on the snapshot; /api/requests/live uses the same rows.
+        """
+        rows = self.taps.snapshot()
+        for row in rows:
+            handle = self.inflight.get(str(row.get("id")))
+            row["cancellable"] = bool(handle is not None and handle.abortable
+                                       and not handle.cancelled)
+            row["cancelled"] = bool(handle is not None and handle.cancelled)
+        return rows
+
     def snapshot(self) -> dict:
         controller = self.controller.info() if self.controller else {"state": "unknown"}
         tokens = self.store.token_totals(cache_ratio=self.engine.cache_hit_ratio())
@@ -133,7 +150,7 @@ class Runtime:
             "engine_error": self.engine.last_error,
             "gpu": self.gpu.info(),
             "kvcache": self.kvcache.view(),
-            "live": self.taps.snapshot(),
+            "live": self.live_requests(),
             "summary": self.store.summary(),
             "tokens": tokens,
             "billing": snapshot_report(self.cfg.root.billing, tokens, self.store.energy_totals()),

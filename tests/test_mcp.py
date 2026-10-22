@@ -91,3 +91,47 @@ def test_metrics_sections(monkeypatch):
     assert srv.llm_metrics("billing")["billing"]["history"]["total"] == 0.9
     unknown = srv.llm_metrics("nope")
     assert "ledger" in unknown["available"] and "billing" in unknown["available"]
+
+
+# -- the HTTP endpoint lives on the control port, not on a port of its own ----
+def test_mcp_is_mounted_on_the_control_port(tmp_path, monkeypatch):
+    import asyncio
+
+    import httpx
+
+    from monitor.api import build_api
+    from monitor.config import Config
+    from monitor.runtime import Runtime
+
+    cfg = Config(str(tmp_path / "config.yaml"))
+    cfg.data["paths"]["run_dir"] = "run"
+    cfg.data["paths"]["state_dir"] = "state"
+    cfg.data["server"]["auth_token"] = "s3cret"
+    monkeypatch.setattr(srv, "DEFAULT_URL", "http://127.0.0.1:9000")
+    monkeypatch.setattr(srv, "_client", None)
+    app = build_api(Runtime(cfg))
+
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "pytest", "version": "1"}}}
+    listing = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+    headers = {"accept": "application/json, text/event-stream",
+               "content-type": "application/json", "x-monitor-token": "s3cret"}
+
+    async def roundtrip() -> tuple[httpx.Response, httpx.Response, httpx.Response]:
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://monitor") as c:
+                # no token → the UI's middleware covers /mcp too
+                denied = await c.post("/mcp", json=init, headers={**headers, "x-monitor-token": ""})
+                # exact path: a Mount would answer 307 /mcp/ and httpx does not follow
+                hello = await c.post("/mcp", json=init, headers=headers)
+                tools = await c.post("/mcp", json=listing, headers=headers)
+                return denied, hello, tools
+
+    denied, hello, tools = asyncio.run(roundtrip())
+    assert denied.status_code == 401
+    assert hello.status_code == 200, hello.text
+    assert "llm-monitor" in hello.text
+    assert tools.status_code == 200, tools.text
+    assert "llm_status" in tools.text and "llm_bench" in tools.text

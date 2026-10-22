@@ -151,6 +151,44 @@ async def controller_loop(rt: Runtime) -> None:
         await asyncio.sleep(interval)
 
 
+async def gateway_watchdog_loop(rt: Runtime) -> None:
+    """Abort requests that run away before they eat the GPU for an hour.
+
+    A Qwen3 thinking loop happily generates until it hits the context limit:
+    measured on this box, one non-streamed request produced ~100k tokens and
+    held the engine for 26 minutes while looking idle in the UI. Off by default
+    because the thresholds are policy, not observation (config.yaml →
+    gateway.watchdog).
+    """
+    cfg = rt.cfg.root.gateway.watchdog
+    if not bool(cfg.enabled):
+        return
+    interval = max(1.0, float(cfg.check_interval_s or 5.0))
+    max_tokens = int(cfg.max_generated_tokens or 0)
+    max_wall = float(cfg.max_wall_s or 0)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            for item in rt.inflight.snapshot():
+                if item.get("cancelled"):
+                    continue
+                tokens = int(item.get("thinking_tokens") or 0) + int(item.get("content_tokens") or 0)
+                wall = float(item.get("elapsed_ms") or 0) / 1000.0
+                reason = None
+                if max_tokens and tokens >= max_tokens:
+                    reason = f"watchdog: {tokens} generated tokens >= {max_tokens}"
+                elif max_wall and wall >= max_wall:
+                    reason = f"watchdog: {wall:.0f}s >= {max_wall:.0f}s"
+                if reason is None:
+                    continue
+                result = await rt.inflight.cancel(str(item["id"]), reason)
+                rt.publish({"type": "request_cancelled", "id": item["id"],
+                            "reason": reason, "aborted": bool(result.get("aborted"))})
+                log.warning("watchdog aborted %s (%s)", item["id"], reason)
+        except Exception as exc:  # pragma: no cover - never kill the monitor
+            log.debug("watchdog error: %s", exc)
+
+
 async def maintenance_loop(rt: Runtime) -> None:
     """Keep the disk bounded: trim logs, cap the DB (see maintenance.py)."""
     interval = max(5.0, float(rt.cfg.root.logs.check_interval_s))
@@ -262,6 +300,7 @@ async def run(cfg: Config) -> None:
         asyncio.create_task(controller_loop(rt), name="controller"),
         asyncio.create_task(kvcache_loop(rt), name="kvcache"),
         asyncio.create_task(jsonl_loop(rt), name="jsonl"),
+        asyncio.create_task(gateway_watchdog_loop(rt), name="watchdog"),
         asyncio.create_task(maintenance_loop(rt), name="maintenance"),
     ]
 
@@ -275,11 +314,14 @@ async def run(cfg: Config) -> None:
     log.info("gateway  : http://%s:%s/  -> engine 127.0.0.1:%s", gw_host, gw_port, engine_port)
 
     _disable_uvicorn_signals()
+    # `timeout_graceful_shutdown` so a restart is not hostage to whatever is
+    # generating right now: without it uvicorn drains in-flight requests forever
+    # and SIGTERM looks like a hang (the ports close, the process stays).
     servers = [
         uvicorn.Server(uvicorn.Config(api, host=ui_host, port=ui_port, log_level="warning",
-                                      access_log=False)),
+                                      access_log=False, timeout_graceful_shutdown=5)),
         uvicorn.Server(uvicorn.Config(gateway, host=gw_host, port=gw_port, log_level="warning",
-                                      access_log=False)),
+                                      access_log=False, timeout_graceful_shutdown=5)),
     ]
 
     stop_event = asyncio.Event()

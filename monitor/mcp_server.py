@@ -1,8 +1,14 @@
 """MCP server: every control/observation the web UI has, exposed as tools.
 
 Transports:
+    <UI process>                                      # /mcp on the control port (mount_http)
     python -m monitor.mcp_server                      # stdio (pi, claude code, …)
-    python -m monitor.mcp_server --transport http     # streamable HTTP on :9001/mcp
+    python -m monitor.mcp_server --transport http     # standalone streamable HTTP on :9001/mcp
+
+The UI process serves the MCP endpoint itself (http://<ui_host>:9000/mcp), the
+same way most agent products do: one port, no extra daemon to babysit. The
+standalone HTTP/SSE transports stay for clients that cannot reach the UI or
+cannot spawn a subprocess.
 
 It is a thin client of the monitor REST API, so the UI and the MCP tools can
 never drift apart.
@@ -11,13 +17,15 @@ never drift apart.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import time
-from typing import Any
+from typing import Any, AsyncIterator
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 DEFAULT_URL = os.environ.get("MONITOR_URL", "http://127.0.0.1:9000")
 TOKEN = os.environ.get("MONITOR_TOKEN", "")
@@ -40,6 +48,54 @@ def client() -> httpx.Client:
         headers = {"x-monitor-token": TOKEN} if TOKEN else {}
         _client = httpx.Client(base_url=DEFAULT_URL, timeout=120.0, headers=headers)
     return _client
+
+
+def mount_http(app: Any, *, base_url: str | None = None, token: str | None = None,
+               path: str = "/mcp") -> None:
+    """Serve the MCP endpoint from an existing FastAPI/Starlette app.
+
+    Keeps the one-port layout: the control plane answers the UI on `/`, the REST
+    API on `/api/*` and MCP on `/mcp`, so no extra process, no extra port, and
+    the UI's auth middleware covers MCP too.
+
+    Stateless is deliberate: the tools are pure REST calls, so there is nothing
+    to keep per session, and a long-lived session id would break as soon as the
+    UI process restarts.
+
+    The caller must run `http_lifespan` in its own lifespan; Starlette does not
+    propagate lifespans to mounted apps.
+    """
+    global DEFAULT_URL, TOKEN, _client
+    if base_url:
+        DEFAULT_URL = base_url.rstrip("/")
+        _client = None
+    if token is not None:
+        TOKEN = token
+        _client = None
+    mcp.settings.streamable_http_path = path
+    mcp.settings.stateless_http = True
+    # FastMCP pins the Host header to loopback when it binds 127.0.0.1, but this
+    # endpoint lives on the UI port, which is served on 0.0.0.0 and reached by
+    # LAN IP / hostname — that pin would answer every real client with 421.
+    # The UI's token middleware is the guard here, as it is for the REST API.
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False)
+    sub = mcp.streamable_http_app()
+    # Copy the route instead of app.mount(): a Mount answers /mcp with a 307 to
+    # /mcp/, and a POST that gets redirected once per request is just noise.
+    app.router.routes.extend(sub.routes)
+    app.state.mcp_session_manager = mcp.session_manager
+
+
+@contextlib.asynccontextmanager
+async def http_lifespan(app: Any = None) -> AsyncIterator[None]:
+    """Lifespan for an app that mounted the MCP route via `mount_http`."""
+    manager = getattr(getattr(app, "state", None), "mcp_session_manager", None)
+    if manager is None:
+        yield
+        return
+    async with manager.run():
+        yield
 
 
 def _get(path: str, **params: Any) -> Any:
@@ -235,6 +291,19 @@ def llm_gpu() -> dict:
 def llm_live_requests() -> dict:
     """Requests currently in flight, with phase (queued/prefill/decode), tokens so far and output tails."""
     return _get("/api/requests/live")
+
+
+@mcp.tool()
+def llm_cancel_request(request_id: str, confirm: bool = False) -> dict:
+    """Abort one in-flight request (closes the upstream stream; the engine aborts it).
+
+    Use llm_live_requests for the ids. Requests whose upstream is not streaming
+    cannot be aborted - the API answers 409 and the engine keeps generating.
+    """
+    if not confirm:
+        return {"hint": "call again with confirm=true to abort this request",
+                "request_id": request_id}
+    return _post(f"/api/requests/{request_id}/cancel")
 
 
 @mcp.tool()

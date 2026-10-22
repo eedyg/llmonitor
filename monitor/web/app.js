@@ -533,6 +533,18 @@
       head.append(el("span", `badge ${r.phase || ""}`, phaseLabel(r.phase)));
       head.append(el("span", "ep", shortProto(r.protocol) + (r.stream ? " · stream" : "")));
       head.append(el("span", "time", `${fmt((r.elapsed_ms || 0) / 1000, 2)}s`));
+      if (r.cancellable) {
+        const cancel = el("button", "req-cancel", "取消");
+        cancel.type = "button";
+        cancel.title = "中止这个请求（关掉上游流，引擎会 abort 它）";
+        cancel.addEventListener("click", async (ev) => {
+          ev.stopPropagation();
+          if (!confirm(`中止 ${r.id}？`)) return;
+          const res = await post(`/api/requests/${r.id}/cancel`, {});
+          if (res && res.ok) toast("已中止", `${r.id} · ${res.reason || ""}`, "ok");
+        });
+        head.append(cancel);
+      }
       card.append(head);
 
       const meta = el("div", "req-meta");
@@ -1178,18 +1190,31 @@
   }
 
   /* ── engine schema form ─────────────────────────────────────────────── */
+  // Per-engine option overrides survive reloads, but a change to the spec/config
+  // defaults must win over an override saved against the *old* defaults — the
+  // start form should open on today's configuration, not on yesterday's.
   function savedOptions(engine) {
     try {
-      return JSON.parse(localStorage.getItem(`llm-monitor-opts-${engine}`) || "{}");
+      const raw = localStorage.getItem(`llm-monitor-opts-${engine}`);
+      if (!raw) return {};
+      const current = (state.schemas[engine] || {}).defaults_version || "";
+      const stamp = localStorage.getItem(`llm-monitor-opts-${engine}-ver`);
+      if (current && stamp && stamp !== current) {
+        localStorage.removeItem(`llm-monitor-opts-${engine}`);
+        localStorage.removeItem(`llm-monitor-opts-${engine}-ver`);
+        return {};
+      }
+      return JSON.parse(raw) || {};
     } catch {
       return {};
     }
   }
-
   function saveOption(engine, key, value) {
     const values = savedOptions(engine);
     values[key] = value;
     localStorage.setItem(`llm-monitor-opts-${engine}`, JSON.stringify(values));
+    const current = (state.schemas[engine] || {}).defaults_version;
+    if (current) localStorage.setItem(`llm-monitor-opts-${engine}-ver`, current);
   }
 
   function selectEngineButton(engine) {

@@ -11,7 +11,9 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from .assemble import ChatAssembler
 from .compat import chat_to_completion, to_chat_request
+from .inflight import Inflight
 from .runtime import Runtime
 from .tap import CHAT, PROTOCOL_BY_PATH, Record, StreamTap, request_meta
 
@@ -49,6 +51,11 @@ def build_gateway(rt: Runtime) -> FastAPI:
     base = f"http://127.0.0.1:{int(cfg.root.server.engine_port)}"
     max_capture = int(cfg.root.gateway.max_capture_bytes)
     force_usage = bool(cfg.root.gateway.force_usage_chunk)
+    # Ask the engine for a stream even when the client asked for one JSON body:
+    # that is the only way to see per-token progress and the only way to abort
+    # (see assemble.py / inflight.py). See config.yaml → gateway.upstream_stream.
+    upstream_stream = bool(cfg.root.gateway.upstream_stream)
+    default_max_tokens = int(cfg.root.gateway.default_max_tokens or 0)
 
     def _finish(record: Record, status: int | None, error: str | None = None) -> None:
         if record.finished_at is not None:
@@ -144,6 +151,38 @@ def build_gateway(rt: Runtime) -> FastAPI:
         if api_key and "authorization" not in {k.lower() for k in headers}:
             headers["authorization"] = f"Bearer {api_key}"
 
+        # ---- request policy: cap, then streaming upstream -------------------
+        # 1) A default max_tokens keeps a looping model from generating until it
+        #    hits the context limit (a Qwen3 thinking loop did 100k+ tokens and
+        #    held the GPU for 26 minutes); 0 = never inject, leave clients alone.
+        # 2) A non-streamed request is invisible and unabortable: the engine
+        #    consumes the whole generation inside its own process. Rewriting it
+        #    to a stream gives the tap every delta and gives the cancel API a
+        #    handle to close (vLLM aborts when its generator is closed).
+        assembler: ChatAssembler | None = None
+        if proto == "openai_chat" and isinstance(payload, dict) and not translate:
+            if (default_max_tokens and payload.get("max_tokens") is None
+                    and payload.get("max_completion_tokens") is None):
+                payload = {**payload, "max_tokens": default_max_tokens}
+                upstream_body = json.dumps(payload).encode()
+                if record is not None:
+                    record.max_tokens = default_max_tokens
+            if (upstream_stream and not payload.get("stream") and not stream_body
+                    and _can_assemble(payload)):
+                chat_body = dict(payload)
+                options = chat_body.get("stream_options")
+                options = dict(options) if isinstance(options, dict) else {}
+                options.setdefault("include_usage", True)
+                chat_body["stream"] = True
+                chat_body["stream_options"] = options
+                payload = chat_body
+                upstream_body = json.dumps(chat_body).encode()
+                assembler = ChatAssembler()
+                if record is not None:
+                    # The client still gets a single JSON body: `stream` keeps
+                    # the value the client asked for, that is what the UI shows.
+                    record.stream = False
+
         if force_usage and proto in ("openai_chat", "openai_text"):
             if translate and isinstance(payload, dict) and payload.get("stream"):
                 chat_body = json.loads(upstream_body)
@@ -166,7 +205,8 @@ def build_gateway(rt: Runtime) -> FastAPI:
 
         tap: StreamTap | None = None
         if record is not None:
-            tap = StreamTap(record, wire=wire)
+            tap = StreamTap(record, wire=wire,
+                            on_event=assembler.feed_event if assembler is not None else None)
 
         client: httpx.AsyncClient = app.state.client
         try:
@@ -210,8 +250,62 @@ def build_gateway(rt: Runtime) -> FastAPI:
         if record is not None and upstream.status_code >= 400:
             out_headers["x-monitor-request-id"] = record.id
 
+        # ---- assembled: streamed upstream, one JSON body for the client ---
+        if assembler is not None:
+            handle = None
+            if record is not None:
+                handle = rt.inflight.add(Inflight(id=record.id, abortable=True,
+                                                  record=record, upstream=upstream))
+            try:
+                if upstream.status_code >= 400:
+                    raw = await upstream.aread()
+                    if record is not None:
+                        _finish(record, upstream.status_code, _error_text(raw))
+                    rt.gateway["errors"] += 1
+                    return Response(content=raw, status_code=upstream.status_code,
+                                    headers=out_headers)
+                async for chunk in upstream.aiter_raw():
+                    if tap is not None:
+                        tap.feed(chunk)
+                raw = json.dumps(assembler.result(), ensure_ascii=False).encode()
+                rt.gateway["bytes_out"] += len(raw)
+                out_headers["content-type"] = "application/json"
+                if record is not None:
+                    out_headers["x-monitor-request-id"] = record.id
+                    _finish(record, 200)
+                return Response(content=raw, status_code=upstream.status_code, headers=out_headers)
+            except Exception as exc:
+                cancelled = handle is not None and handle.cancelled
+                reason = (handle.reason if handle is not None and handle.reason
+                          else f"upstream died mid-stream: {type(exc).__name__}: {exc}")
+                if record is not None:
+                    _finish(record, 499 if cancelled else 502, reason)
+                rt.gateway["errors"] += 1
+                return JSONResponse(
+                    status_code=499 if cancelled else 502,
+                    content={"error": {
+                        "message": reason,
+                        "type": "monitor_cancelled" if cancelled else "monitor_upstream_error",
+                    }},
+                )
+            finally:
+                if record is not None:
+                    rt.inflight.drop(record.id)
+                    if record.finished_at is None:
+                        # The client vanished mid-generation (or we were
+                        # cancelled): finish the bookkeeping anyway, otherwise
+                        # the record leaks in the live list and in_flight never
+                        # drops. aclose() below still aborts the engine.
+                        _finish(record, 499, "client disconnected")
+                await upstream.aclose()
+
         # ---- non-streaming: buffer, tap, return ---------------------------
         if not is_sse:
+            if record is not None:
+                # Registered so /cancel can answer honestly: the engine has
+                # already swallowed this generation, nothing here can stop it.
+                rt.inflight.add(Inflight(id=record.id, abortable=False,
+                                         record=record, upstream=upstream))
             try:
                 if proto is None:
                     raw = b""
@@ -250,9 +344,18 @@ def build_gateway(rt: Runtime) -> FastAPI:
                     out_headers["x-monitor-request-id"] = record.id
                 return Response(content=raw, status_code=status, headers=out_headers)
             finally:
+                if record is not None:
+                    rt.inflight.drop(record.id)
+                    if record.finished_at is None:
+                        _finish(record, 499, "client disconnected")
                 await upstream.aclose()
 
         # ---- streaming ----------------------------------------------------
+        live = None
+        if record is not None:
+            live = rt.inflight.add(Inflight(id=record.id, abortable=True,
+                                           record=record, upstream=upstream))
+
         async def relay():
             error: str | None = None
             try:
@@ -282,10 +385,24 @@ def build_gateway(rt: Runtime) -> FastAPI:
                         yield chunk
             except Exception as exc:  # client gone or upstream died mid-stream
                 error = f"{type(exc).__name__}: {exc}"
+                if live is not None and live.cancelled:
+                    # A dropped connection looks like a clean finish to an SSE
+                    # client, so say it out loud before the stream ends.
+                    out = json.dumps({"error": {
+                        "message": live.reason or "cancelled from the monitor",
+                        "type": "monitor_cancelled",
+                    }}, ensure_ascii=False)
+                    chunk = f"data: {out}\n\n".encode()
+                    rt.gateway["bytes_out"] += len(chunk)
+                    yield chunk
             finally:
+                if record is not None:
+                    rt.inflight.drop(record.id)
                 await upstream.aclose()
                 if record is not None:
-                    if error and ("Cancelled" in error or "GeneratorExit" in error):
+                    if live is not None and live.cancelled:
+                        _finish(record, 499, live.reason or "cancelled from the monitor")
+                    elif error and ("Cancelled" in error or "GeneratorExit" in error):
                         _finish(record, upstream.status_code, "client disconnected")
                     else:
                         _finish(record, upstream.status_code, error)
@@ -299,6 +416,21 @@ def build_gateway(rt: Runtime) -> FastAPI:
         await app.state.client.aclose()
 
     return app
+
+
+def _can_assemble(payload: dict) -> bool:
+    """Only the plain single-choice text path may be rewritten to a stream.
+
+    `n > 1` and `logprobs` shape the wire response in ways that are easy to get
+    subtly wrong, so those clients keep the old buffer-and-forward path. They
+    also stay unabortable, which /api/requests/{id}/cancel reports honestly.
+    """
+    try:
+        if int(payload.get("n") or 1) > 1:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return not (payload.get("logprobs") or payload.get("top_logprobs"))
 
 
 def _error_text(raw: bytes) -> str:

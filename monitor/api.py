@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -23,7 +24,16 @@ WEB_DIR = Path(__file__).parent / "web"
 
 def build_api(rt: Runtime) -> FastAPI:
     cfg = rt.cfg
-    app = FastAPI(title="llm-monitor", docs_url="/api/docs", redoc_url=None)
+    # The MCP endpoint rides on this app (see the mount at the end of the
+    # function). Imported here rather than at module level so the control plane
+    # still starts if the optional `mcp` dependency is missing.
+    try:
+        from .mcp_server import http_lifespan, mount_http
+    except ImportError:  # pragma: no cover - mcp is declared in requirements.txt
+        http_lifespan = None  # type: ignore[assignment]
+        mount_http = None  # type: ignore[assignment]
+    app = FastAPI(title="llm-monitor", docs_url="/api/docs", redoc_url=None,
+                  lifespan=http_lifespan)
     app.state.rt = rt
 
     @app.middleware("http")
@@ -100,7 +110,25 @@ def build_api(rt: Runtime) -> FastAPI:
 
     @app.get("/api/requests/live")
     async def live_requests() -> dict:
-        return {"items": rt.taps.snapshot()}
+        return {"items": rt.live_requests()}
+
+    @app.post("/api/requests/{request_id}/cancel")
+    async def cancel_request(request_id: str) -> dict:
+        """Abort one in-flight request.
+
+        The lever is the upstream connection: closing it makes vLLM abort the
+        request (its output generator is closed). Requests whose upstream is not
+        streaming cannot be aborted - the engine owns the generation - and the
+        API says so instead of pretending.
+        """
+        result = await rt.inflight.cancel(request_id)
+        if not result.get("found"):
+            raise HTTPException(404, result.get("error") or "unknown request id")
+        if not result.get("aborted"):
+            raise HTTPException(409, result.get("note") or "request is not abortable")
+        rt.publish({"type": "request_cancelled", "id": request_id,
+                    "reason": result.get("reason")})
+        return result
 
     @app.get("/api/requests/{request_id}")
     async def request_detail(request_id: str) -> dict:
@@ -157,6 +185,12 @@ def build_api(rt: Runtime) -> FastAPI:
                 data[name] = launcher.engine_schema(name)
                 data[name]["default_profile"] = rt.controller.default_profile(name)
                 rt.controller.apply_kvcache_defaults(data[name])
+                rt.controller.apply_model_choices(data[name], name)
+                # Fingerprint of the defaults the form shows. The UI keeps a
+                # per-engine localStorage override; when this changes (a yaml or
+                # config default was edited) the stale override is dropped once,
+                # so the start form always opens on today's defaults.
+                data[name]["defaults_version"] = _schema_version(data[name])
             except Exception as exc:  # pragma: no cover
                 data[name] = {"engine": name, "error": str(exc), "options": []}
         return {"engines": data, "default": rt.cfg.root.engine.default,
@@ -491,7 +525,31 @@ def build_api(rt: Runtime) -> FastAPI:
         )
         return HTMLResponse(html, headers={"Cache-Control": "no-store, max-age=0"})
 
+    # -- MCP (same port as the UI) ------------------------------------------
+    # The agent-facing face of the same control plane: http://<ui_host>:9000/mcp.
+    # Mounted last so the API and UI routes keep their exact-path priority; the
+    # no-store/token middleware above already covers /mcp.
+    ui_host = str(cfg.root.server.ui_host)
+    loopback = "127.0.0.1" if ui_host in ("", "0.0.0.0", "::", "[::]") else ui_host
+    if mount_http is not None:
+        mount_http(
+            app,
+            base_url=f"http://{loopback}:{int(cfg.root.server.ui_port)}",
+            token=str(cfg.root.server.auth_token or ""),
+        )
+
     return app
+
+
+def _schema_version(schema: dict) -> str:
+    """Short fingerprint of an engine's launch defaults (see /api/engines)."""
+    payload = {
+        "ctx": schema.get("default_ctx"),
+        "profile": schema.get("default_profile"),
+        "options": sorted((str(o.get("key")), str(o.get("default")))
+                          for o in schema.get("options") or []),
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]
 
 
 def render_prometheus(snap: dict) -> str:

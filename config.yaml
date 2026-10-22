@@ -64,6 +64,20 @@ gateway:
   max_capture_bytes: 8388608
   # Upstream connect timeout (seconds); generation itself is never timed out.
   connect_timeout_s: 10
+  # 客户端发 stream:false 时，也向上游要流式。非流式请求在引擎里是“黑盒”：看不到 token
+  # 进度（UI 只能显示 queued / 0 token），也**无法中止**（引擎自己把整条流吃完了）。
+  # 改写后 tap 能看到逐 token，并且 cancel 才有手段（关上游流 → vLLM abort）。
+  # 只有 n>1 / logprobs 的请求会自动走老路。
+  upstream_stream: true
+  # 客户端没带 max_tokens 时兜底注入（0 = 不注入）。思考死循环会一直生成到上下文上限，
+  # 实测一条请求烧了 26 分钟、10 万+ token；设了值循环最多烧这么久。
+  default_max_tokens: 0
+  # 自动中止跑飞的请求（Qwen3 思考死循环）。默认关；阈值按需开。
+  watchdog:
+    enabled: false
+    max_generated_tokens: 0     # 0 = 不按 token 限制
+    max_wall_s: 0               # 0 = 不按墙钟限制
+    check_interval_s: 5
 
 collect:
   metrics_interval_s: 2.0
@@ -81,17 +95,28 @@ collect:
 # ---------------------------------------------------------------------------
 kvcache:
   enabled: true                 # 总开关；也决定引擎启动时是否带 offload 参数
-  cpu_bytes_to_use: "12G"       # 第 2 级（CPU 主层）预算；12G = 12 GiB
+  # 第 2 级（CPU 主层）预算。12G = 12 GiB。
+  # 这台机是 46 GiB 共享机（还有 scrylink/eestock/Godot 等容器 + cursor-server），
+  # 这一层是 /dev/shm 的 unevictable tmpfs，不能回收也不能换出：曾经配 12G，
+  # 叠加双重映射后 shmem-rss 到 23.7 GiB，swap 被吃满 → 内核 global OOM 把
+  # VLLM::EngineCore 打死（dmesg 2026-10-21 16:19）。
+  # 2026-10-22 重新拉回 12G：ctx 降到 128k 后单个请求 KV ≈ 4.65 GiB，12 GiB 能
+  # 装下 ~2.5 个请求，才不会再动不动掉到磁盘层（6G 连一个 256k 请求都装不下）。
+  # 代价：可用内存从 ~21 GiB 降到 ~15 GiB，得盯着 free / hindsight。
+  # 改这里需要重启 monitor 才生效（启动时读配置）。
+  cpu_bytes_to_use: "12G"
   disk_dir: "/mnt/kvcache/kvoffload"   # 第 3 级磁盘层根目录（宿主机路径）
-  # 磁盘层上限（GiB）。0 = 用满所在分区但自动保留 capacity×5%（≥2 GiB）。
-  # 卷布局（vg_ssd1，870 GiB）：docker 350 / models 340 / kvcache 180。
-  #   - kvcache 文件系统 177 GiB，保留区 ≈8.8 GiB → 可用 ≈168 GiB
-  #   - 保留区是硬性保护：写满曾导致 2102 次 ENOSPC、150k prefill 从 65s 劣化到 268s
-  # 显式值会被「分区容量 − 保留区」钳制，所以写 200 也不会突破安全线。
-  disk_limit_gb: 0
+  # 磁盘层上限（GiB）。monitor 侧硬上限：vLLM 的 fs tier 没有容量参数，
+  # 超限由 monitor 回收最旧的块文件（回收到 reclaim_target_ratio 水位）。
+  #   150 → 150 GiB 触发，稳态回收到 ≈127.5 GiB
+  # 0 的语义是「用满所在分区但自动保留 capacity×5%（≥2 GiB）」，不是不缓存：
+  #   kvcache 文件系统 177 GiB，保留区 ≈8.8 GiB → 自动模式 ≈168 GiB。
+  # 不变式：任何值都被「分区容量 − 保留区」钳制，写 200 也不会突破安全线。
+  # 保留区是硬性保护：写满曾导致 2102 次 ENOSPC、150k prefill 从 65s 劣化到 268s。
+  disk_limit_gb: 150
   eviction_policy: "arc"        # CPU 主层驱逐策略：lru / arc
-  # 回收目标水位：触发后裁到这里（占生效上限的比例）。0.85 → 稳态在 143–168 GiB
-  # 之间震荡，分区常驻 9–34 GiB 余量。调高省空间、调低留余量。
+  # 回收目标水位：触发后裁到这里（占生效上限的比例）。0.85 → 上限 150 时稳态在
+  # 127.5–150 GiB；auto 模式（0）则是 143–168 GiB。调高省空间、调低留余量。
   reclaim_target_ratio: 0.85
   # 容量与 IO 采集频率（低频即可，磁盘遍历有成本）
   collect_interval_s: 30

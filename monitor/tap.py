@@ -234,12 +234,16 @@ class StreamTap:
     """Consumes SSE bytes and mutates one Record."""
 
     def __init__(self, record: Record, wire: str | None = None,
-                 on_first_token: Callable[[Record], None] | None = None) -> None:
+                 on_first_token: Callable[[Record], None] | None = None,
+                 on_event: Callable[[dict], None] | None = None) -> None:
         self.record = record
         self.wire = wire or record.protocol
         self.buf = b""
         self.done = False
         self.on_first_token = on_first_token
+        # Raw parsed event hook: lets the gateway rebuild a non-streaming body
+        # from the same deltas it taps (see assemble.ChatAssembler).
+        self.on_event = on_event
 
     # -- SSE framing --------------------------------------------------------
     def feed(self, chunk: bytes) -> None:
@@ -276,6 +280,11 @@ class StreamTap:
             return
         if not isinstance(obj, dict):
             return
+        if self.on_event is not None:
+            try:
+                self.on_event(obj)
+            except Exception:  # an assembler bug must never break the stream
+                pass
         record = self.record
         try:
             if self.wire == ANTHROPIC or event.startswith("message_") or event.startswith("content_block_"):
