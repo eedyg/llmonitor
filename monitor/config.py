@@ -103,6 +103,11 @@ DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "cpu_bytes_to_use": "12G",
         "disk_dir": "/mnt/kvcache/kvoffload",
+        # Disk tier (vLLM fs secondary tier) on/off. It is the one tier that
+        # cannot age itself out: vLLM 0.31's FileSystemTierManager has no
+        # capacity and no eviction, so a busy engine fills the partition and
+        # every further store fails with ENOSPC. Off = CPU tier only.
+        "disk_enabled": True,
         "disk_limit_gb": 0,
         "eviction_policy": "arc",
         "reclaim_target_ratio": 0.85,
@@ -184,6 +189,7 @@ _ENV_MAP = {
     "MONITOR_KVCACHE_ENABLED": ("kvcache", "enabled"),
     "MONITOR_KVCACHE_CPU": ("kvcache", "cpu_bytes_to_use"),
     "MONITOR_KVCACHE_DIR": ("kvcache", "disk_dir"),
+    "MONITOR_KVCACHE_DISK_ENABLED": ("kvcache", "disk_enabled"),
     "MONITOR_KVCACHE_LIMIT_GB": ("kvcache", "disk_limit_gb"),
     "MONITOR_KVCACHE_DEVICE": ("kvcache", "device"),
     "MONITOR_KVCACHE_INTERVAL": ("kvcache", "collect_interval_s"),

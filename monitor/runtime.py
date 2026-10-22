@@ -42,6 +42,7 @@ class Runtime:
             directory=cfg.p("kvcache.disk_dir"),
             cpu_budget_bytes=parse_kv_size(kv.cpu_bytes_to_use) if bool(kv.enabled) else 0,
             disk_limit_bytes=int(float(kv.disk_limit_gb or 0) * 1024 ** 3),
+            disk_enabled=bool(getattr(kv, "disk_enabled", True)),
             device=str(kv.device or ""),
             interval_s=float(kv.collect_interval_s),
             health_interval_s=float(kv.health_interval_s),

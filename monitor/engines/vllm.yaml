@@ -67,6 +67,15 @@ defaults:
   # Layer switch for the offload layer below (1 = append --kv-transfer-config).
   # The monitor sets it from config.yaml → kvcache.enabled.
   offload_enabled: "0"
+  # Whether that layer also carries the disk (fs) secondary tier. 1 = GPU → CPU
+  # → 磁盘, 0 = GPU → CPU only. The monitor sets it from config.yaml →
+  # kvcache.disk_enabled, and the UI can override it per launch.
+  # Why it is a switch at all: vLLM 0.31's FileSystemTierManager has no capacity
+  # limit and no eviction, so it keeps writing until the syscall fails with
+  # ENOSPC (measured: partition 100 % full, 2959 cascade failures, disk hit
+  # rate 10 %). No disk tier = nothing to fill, at the cost of losing prefix
+  # reuse across engine restarts.
+  kv_disk_enabled: "1"
   # Disk-tier budget in GiB (0 = use the whole filesystem). vLLM's fs tier has
   # no capacity limit of its own, so the monitor enforces this by reclaiming
   # the oldest block files (see monitor/kvcache.py).
@@ -204,6 +213,7 @@ profiles:
 layers:
   - when:
       offload_enabled: {truthy: true}
+      kv_disk_enabled: {truthy: true}
       profile: {not_in: [kv2, kv3]}
     mounts:
       - "${kvoffload_dir}:/kvoffload"
@@ -224,6 +234,23 @@ layers:
             "n_read_threads":16,"n_write_threads":8,"locality":"LOCAL",
             "backpressure":{"backpressure_cls":"EMABackpressureDetector",
               "policy_cls":"DropStorePolicy"}}]}}
+
+  # Same layer without the disk tier: the CPU primary tier keeps serving prefix
+  # hits, and no fs tier exists to fill a partition or to reclaim from. The
+  # kvoffload directory is not mounted either, so nothing can be written there.
+  - when:
+      offload_enabled: {truthy: true}
+      kv_disk_enabled: {falsy: true}
+      profile: {not_in: [kv2, kv3]}
+    args:
+      - "--enable-mamba-shared-prefix-checkpoint"
+      - "--kv-transfer-config"
+      - |-
+        {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{
+          "spec_name":"TieringOffloadingSpec",
+          "cpu_bytes_to_use":${cpu_bytes_to_use},
+          "eviction_policy":"arc",
+          "secondary_tiers":[]}}
 
 # Fields rendered by the web UI for THIS engine. `key` is the launcher variable
 # name, so adding a field never needs UI code.
@@ -296,6 +323,12 @@ options:
     type: bool
     default: "0"
     hint: "开 = GPU → CPU 内存 → 磁盘；默认值来自 config.yaml → kvcache.enabled"
+  - key: kv_disk_enabled
+    label: "磁盘层"
+    type: bool
+    default: "1"
+    show_if: {offload_enabled: [true, "1", "on"]}
+    hint: "开 = 多一级磁盘 cache（vLLM fs 层，引擎重启后仍能复用前缀）；关 = 只保留 CPU 内存层。vLLM 的 fs 层没有淘汰，写满会一路 ENOSPC；改动在下次启动引擎时生效"
   - key: cpu_bytes_to_use
     label: "内存 cache"
     type: size
@@ -307,7 +340,7 @@ options:
     label: "磁盘 cache 目录"
     type: path
     placeholder: "/mnt/kvcache/kvoffload"
-    show_if: {offload_enabled: [true, "1", "on"]}
+    show_if: {offload_enabled: [true, "1", "on"], kv_disk_enabled: [true, "1", "on"]}
     hint: "宿主机路径，容器内挂到 /kvoffload；默认来自 config.yaml → kvcache.disk_dir"
   - key: api_key
     label: "API Key"

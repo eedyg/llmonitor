@@ -281,3 +281,23 @@ def test_model_choices_are_filled_from_disk(monkeypatch):
     # directory is missing, so the UI never shows an empty select)
     assert opt["default"] == "Qwen3.8-27B-FP8"
     assert "Qwen3.8-27B-FP8" in opt["choices"]
+
+
+def test_disk_tier_can_be_switched_off():
+    """kvcache.disk_enabled=false / UI「磁盘层」= fs tier absent, dir not mounted."""
+    plan = resolve(profile="mtp", offload_enabled="1",
+                   kv_disk_enabled="0", cpu_bytes_to_use="12G")
+    idx = plan.engine_argv.index("--kv-transfer-config")
+    parsed = json.loads(plan.engine_argv[idx + 1])
+    extra = parsed["kv_connector_extra_config"]
+    assert extra["secondary_tiers"] == []
+    # The CPU primary tier is still there, and the disk is not even mounted.
+    assert extra["cpu_bytes_to_use"] == 12884901888
+    assert not any("kvoffload" in mount for mount in plan.mounts)
+
+
+def test_disk_tier_is_on_by_default():
+    plan = resolve(profile="mtp", offload_enabled="1", cpu_bytes_to_use="12G")
+    idx = plan.engine_argv.index("--kv-transfer-config")
+    parsed = json.loads(plan.engine_argv[idx + 1])
+    assert [t["type"] for t in parsed["kv_connector_extra_config"]["secondary_tiers"]] == ["fs"]

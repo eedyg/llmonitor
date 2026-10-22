@@ -332,3 +332,29 @@ def test_explicit_cap_cannot_exceed_the_safe_limit(tmp_path, monkeypatch):
     disk = mon.view()["disk"]
     assert disk["limit_bytes"] == 200 * gib          # 配置原样回显
     assert disk["effective_limit_bytes"] == 98 * gib - disk["reserve_bytes"]
+
+
+def test_disk_tier_disabled_skips_reclaim_and_warning(tmp_path):
+    """kvcache.disk_enabled=false: nothing writes there, so nothing is reclaimed."""
+    for i in range(10):
+        (tmp_path / f"blk{i:02d}.bin").write_bytes(b"q" * 1000)
+    mon = make_monitor(tmp_path, disk_limit_bytes=5_000, disk_enabled=False)
+    mon.collect_disk(now=9.0)
+    disk = mon.view()["disk"]
+    assert disk["enabled"] is False
+    assert disk["files"] == 10          # leftovers stay put
+    assert mon.view()["reclaim"]["last_at"] == 0.0
+    # A full filesystem is a leftover to clean, not an offload failure to warn about.
+    mon.snapshot["disk"]["free_bytes"] = 1
+    mon.snapshot["disk"]["reserve_bytes"] = 1024
+    mon.collect_disk(now=10.0)
+    assert mon.view()["disk"]["near_full"] is False
+
+
+def test_apply_launch_toggles_disk_tier(tmp_path):
+    mon = make_monitor(tmp_path)
+    assert mon.view()["disk"]["enabled"] is True
+    mon.apply_launch({"offload_enabled": "1", "kv_disk_enabled": "0"})
+    assert mon.view()["disk"]["enabled"] is False
+    mon.apply_launch({"offload_enabled": "1", "kv_disk_enabled": "1"})
+    assert mon.view()["disk"]["enabled"] is True

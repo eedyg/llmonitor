@@ -106,7 +106,14 @@ kvcache:
   # 改这里需要重启 monitor 才生效（启动时读配置）。
   cpu_bytes_to_use: "12G"
   disk_dir: "/mnt/kvcache/kvoffload"   # 第 3 级磁盘层根目录（宿主机路径）
-  # 磁盘层上限（GiB）。monitor 侧硬上限：vLLM 的 fs tier 没有容量参数，
+  # 第 3 级（磁盘层）开关。关 = 引擎只带 CPU 主层（GPU → CPU），不再写盘。
+  # 为什么默认关掉（2026-10-22 起）：vLLM 0.31 的 fs 二级层根本没有淘汰——
+  # FileSystemTierManager 无容量参数、无 remove 接口，backpressure 只丢新写入；
+  # 实测 4 小时写满 177 GiB 分区、2959 次 ENOSPC 级联失败，而磁盘命中率只有
+  # 10%。代价：前缀不再跨引擎重启复用（CPU 内存层重启即清空）。
+  # UI 引擎页「磁盘层」可单次覆盖本默认值；改这里或 UI 都需要重启引擎才生效。
+  disk_enabled: false
+  # 磁盘层上限（GiB）。仅磁盘层开启时有效：vLLM 的 fs tier 没有容量参数，
   # 超限由 monitor 回收最旧的块文件（回收到 reclaim_target_ratio 水位）。
   #   150 → 150 GiB 触发，稳态回收到 ≈127.5 GiB
   # 0 的语义是「用满所在分区但自动保留 capacity×5%（≥2 GiB）」，不是不缓存：

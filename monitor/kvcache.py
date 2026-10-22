@@ -28,6 +28,7 @@ Everything runs at a low frequency; see config.yaml → ``kvcache``.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -39,6 +40,13 @@ from typing import Any, Iterable
 
 from .engine import Rates
 from .prom import Metrics
+
+log = logging.getLogger("monitor.kvcache")
+
+# A failing reaper retries every collect_interval_s; journaling every retry would
+# bury the log, so the same failure is only re-reported once per window.
+ERROR_LOG_INTERVAL_S = 600.0
+MIB = 2 ** 20
 
 # -- vLLM metric names (v1/kv_offload/{cpu/common,tiering/base}.py) -------------
 GPU_USAGE = "vllm:kv_cache_usage_perc"
@@ -73,7 +81,7 @@ EMPTY: dict[str, Any] = {
             "region_bytes": 0, "region_used_bytes": 0, "stores_skipped": 0},
     "disk": {"used_bytes": 0, "capacity_bytes": 0, "limit_bytes": 0,
              "effective_limit_bytes": 0, "free_bytes": 0, "reserve_bytes": 0,
-             "near_full": False, "files": 0,
+             "near_full": False, "files": 0, "enabled": True,
              "read_bps": None, "write_bps": None, "read_time_s": 0.0,
              "write_time_s": 0.0, "queries": 0, "hits": 0, "hit_rate": None,
              "promo_fail": 0, "cascade_fail": 0,
@@ -297,6 +305,10 @@ class KvCacheMonitor:
     directory: Path = field(default_factory=lambda: Path("/mnt/kvcache/kvoffload"))
     cpu_budget_bytes: int = 0
     disk_limit_bytes: int = 0
+    # False = the engine runs without the fs secondary tier (CPU tier only).
+    # The directory is then a leftover, not a cache: nothing writes to it, so
+    # there is nothing to protect and reclaim stays out of it.
+    disk_enabled: bool = True
     device: str = ""
     interval_s: float = 30.0
     health_interval_s: float = 120.0
@@ -306,6 +318,7 @@ class KvCacheMonitor:
     _rates: Rates = field(default=None)  # type: ignore[assignment]
     _last_health: float = 0.0
     _shm_region_bytes: int = 0
+    _last_error_log: float = 0.0
 
     def __post_init__(self) -> None:
         if self._rates is None:
@@ -314,6 +327,7 @@ class KvCacheMonitor:
         self.snapshot["dir"] = str(self.directory)
         self.snapshot["cpu"]["budget_bytes"] = int(self.cpu_budget_bytes)
         self.snapshot["disk"]["limit_bytes"] = int(self.disk_limit_bytes)
+        self.snapshot["disk"]["enabled"] = bool(self.disk_enabled)
         self.snapshot["device"] = self.device or (device_for_path(self.directory) or "")
         self.snapshot["health"]["device"] = self.snapshot["device"]
 
@@ -342,11 +356,17 @@ class KvCacheMonitor:
             size = parse_size(budget)
             if size:
                 self.cpu_budget_bytes = size
+        disk_enabled = variables.get("kv_disk_enabled")
+        if disk_enabled not in (None, ""):
+            self.disk_enabled = str(disk_enabled).strip().lower() in (
+                "1", "true", "yes", "on",
+            )
         snap = self.snapshot
         snap["enabled"] = enabled
         snap["dir"] = str(self.directory)
         snap["cpu"]["budget_bytes"] = int(self.cpu_budget_bytes)
         snap["disk"]["limit_bytes"] = int(self.disk_limit_bytes)
+        snap["disk"]["enabled"] = bool(self.disk_enabled)
         # The directory may live on another filesystem now: re-detect the device.
         self.device = device_for_path(self.directory) or ""
         snap["device"] = self.device
@@ -426,10 +446,12 @@ class KvCacheMonitor:
         snap["disk"]["reserve_bytes"] = reserve
         snap["disk"]["free_bytes"] = free
         snap["disk"]["effective_limit_bytes"] = effective
-        snap["disk"]["near_full"] = bool(free and free < reserve)
+        # Nothing writes to the tier when it is off, so a full filesystem is a
+        # leftover to clean up, not an offload failure to warn about.
+        snap["disk"]["near_full"] = bool(self.disk_enabled and free and free < reserve)
         snap["cpu"]["region_bytes"] = self._shm_bytes()
         snap["cpu"]["region_used_bytes"] = self._shm_allocated()
-        if reclaim and effective > 0 and used > effective:
+        if reclaim and self.disk_enabled and effective > 0 and used > effective:
             result = self.reclaim(now, limit_bytes=effective)
             snap["disk"]["used_bytes"] = result["bytes"]
             snap["disk"]["files"] = result["files"]
@@ -478,10 +500,15 @@ class KvCacheMonitor:
         """Delete the oldest block files until usage is back under the limit.
 
         The files are created by the engine (root inside the container) while the
-        monitor runs unprivileged, so a plain unlink hits EACCES on the parent
+        monitor runs unprivileged, so a plain unlink can hit EACCES on the parent
         directory. Failures are therefore retried through ``sudo -n rm``; if that
-        is unavailable too the error is recorded and surfaced in the UI instead
-        of silently doing nothing.
+        is unavailable too (e.g. the systemd unit sets ``NoNewPrivileges=yes``)
+        the error is recorded, surfaced in the UI *and* logged, because a reaper
+        that fails silently is indistinguishable from one that never ran.
+
+        Permissions: ``setfacl -R -m u:<monitor-user>:rwX`` plus a default ACL on
+        the tree (and on the mount point) lets the plain unlink path work even
+        though the engine creates the files as root; that is the intended setup.
         """
         limit = int(limit_bytes if limit_bytes is not None else self.disk_limit_bytes)
         ratio = self.reclaim_target_ratio if target_ratio is None else target_ratio
@@ -503,7 +530,30 @@ class KvCacheMonitor:
             "last_bytes": freed, "last_files": deleted, "last_at": now,
             "error": error,
         }
+        self._log_reclaim(now, used, freed, deleted, target, error)
         return {"bytes": used - freed, "files": files - deleted, "freed": freed}
+
+    def _log_reclaim(self, now: float, used: int, freed: int, deleted: int,
+                     target: int, error: str | None) -> None:
+        """Journal the outcome so a broken reaper is visible outside the UI."""
+        if error:
+            if now - self._last_error_log < ERROR_LOG_INTERVAL_S:
+                return
+            self._last_error_log = now
+            log.warning(
+                "kv disk reclaim failed: freed %.1f MiB in %d file(s), "
+                "used %.1f GiB > target %.1f GiB: %s",
+                freed / MIB, deleted, used / 1024 ** 3, target / 1024 ** 3, error,
+            )
+            return
+        if freed:
+            self._last_error_log = 0.0
+            log.info(
+                "kv disk reclaim: deleted %d file(s), freed %.1f GiB, "
+                "used %.1f -> %.1f GiB (target %.1f GiB)",
+                deleted, freed / 1024 ** 3, used / 1024 ** 3,
+                (used - freed) / 1024 ** 3, target / 1024 ** 3,
+            )
 
     def _unlink_all(self, victims: list[tuple[str, int]]) -> tuple[int, int, str | None]:
         """Unlink the given (path, size) pairs; returns (freed, deleted, error)."""

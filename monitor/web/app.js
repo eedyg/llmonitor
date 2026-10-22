@@ -812,11 +812,13 @@
       ["E2E p50/p90", `${fmt(speed.e2e_p50_ms, 0)} / ${fmt(speed.e2e_p90_ms, 0)} ms`],
       ["队列 p50", `${fmt(speed.queue_p50_ms, 1)} ms`],
       ["抢占 / replay", `${fmtInt(req.preemptions)} / ${fmtInt(req.replaying)}`],
-      ["磁盘 cache 目录", kv.enabled ? (kv.dir || "—") : "offload 已关闭"],
-      ["磁盘 cache 用量", kv.enabled
-        ? `${fmt((disk.used_bytes || 0) / 1024 ** 3, 2)} / ${fmt((disk.capacity_bytes || 0) / 1024 ** 3, 1)} GiB`
-          + (disk.limit_bytes ? `（上限 ${fmt(disk.limit_bytes / 1024 ** 3, 1)} GiB）` : "（不限）")
-        : "—"],
+      ["磁盘 cache 目录", !kv.enabled ? "offload 已关闭"
+        : (disk.enabled === false ? `${kv.dir || "—"}（磁盘层已禁）` : (kv.dir || "—"))],
+      ["磁盘 cache 用量", !kv.enabled ? "—"
+        : (disk.enabled === false
+          ? `已禁用 · 旧数据 ${fmt((disk.used_bytes || 0) / 1024 ** 3, 2)} GiB`
+          : `${fmt((disk.used_bytes || 0) / 1024 ** 3, 2)} / ${fmt((disk.capacity_bytes || 0) / 1024 ** 3, 1)} GiB`
+            + (disk.limit_bytes ? `（上限 ${fmt(disk.limit_bytes / 1024 ** 3, 1)} GiB）` : "（不限）"))],
       ["内存 cache", kv.enabled
         ? `${fmt((cpu.budget_bytes || 0) / 1024 ** 3, 1)} GiB 预算 · 实占 `
           + `${fmt((cpu.region_used_bytes || 0) / 1024 ** 3, 2)} GiB · 在飞 ${fmt(cpu.active_pct, 0)}%`
@@ -910,7 +912,7 @@
     dl.replaceChildren();
     const enabled = !!kv.enabled;
     $("#kv-tier-hint").textContent = enabled
-      ? `${kv.dir || "—"} · 低频采样`
+      ? `${kv.dir || "—"} · 低频采样` + (kv.disk && kv.disk.enabled === false ? " · 磁盘层已关" : "")
       : "未启用（config.yaml → kvcache.enabled）";
     const gpu = kv.gpu || {};
     const cpu = kv.cpu || {};
@@ -928,6 +930,9 @@
     const diskPct = diskLimit
       ? (Number(disk.used_bytes || 0) / diskLimit) * 100
       : null;
+    // 磁盘层是可选的（config.yaml → kvcache.disk_enabled / UI「磁盘层」）：关掉时
+    // 引擎不带 fs 二级层，目录里剩下的只是上一次运行留下的死数据。
+    const diskOff = disk.enabled === false;
     const rows = [
       {
         name: "GPU 显存",
@@ -948,16 +953,20 @@
         title: "实占 = /dev/shm 区域真正落地的内存；在飞 = 被进行中传输临时钉住的占比（vLLM 唯一暴露的指标）",
       },
       {
-        name: "磁盘",
-        pct: diskPct,
-        text: `${gib(disk.used_bytes)} / ${gib(diskLimit)}`
-          + ` · 剩 ${gib(disk.free_bytes)}`
-          + (disk.limit_bytes ? `（上限 ${gib(disk.limit_bytes)}）`
-                              : `（自动保留 ${gib(disk.reserve_bytes)}）`),
-        color: disk.near_full ? "var(--bad)" : "var(--violet)",
-        title: disk.limit_bytes
-          ? "受 kvcache.disk_limit_gb 限制"
-          : "limit=0 → 用满分区但留出保留区，避免 vLLM 写到 ENOSPC",
+        name: diskOff ? "磁盘（未启用）" : "磁盘",
+        pct: diskOff ? 0 : diskPct,
+        text: diskOff
+          ? `已关 · 旧目录仍占 ${gib(disk.used_bytes)}（可手动清理）`
+          : `${gib(disk.used_bytes)} / ${gib(diskLimit)}`
+            + ` · 剩 ${gib(disk.free_bytes)}`
+            + (disk.limit_bytes ? `（上限 ${gib(disk.limit_bytes)}）`
+                                : `（自动保留 ${gib(disk.reserve_bytes)}）`),
+        color: diskOff ? "var(--muted)" : (disk.near_full ? "var(--bad)" : "var(--violet)"),
+        title: diskOff
+          ? "config.yaml → kvcache.disk_enabled=false 或 UI 里关了「磁盘层」：引擎只有 GPU → CPU 两级，不再写盘，跨引擎重启的前缀复用也一并没了"
+          : disk.limit_bytes
+            ? "受 kvcache.disk_limit_gb 限制"
+            : "limit=0 → 用满分区但留出保留区，避免 vLLM 写到 ENOSPC",
       },
     ];
     for (const row of rows) {
@@ -973,25 +982,32 @@
       wrap.append(el("span", "kv-tier-val", row.text));
       box.append(wrap);
     }
-    const info = [
-      ["磁盘 IO", `读 ${mbps(disk.read_bps)} · 写 ${mbps(disk.write_bps)}`],
-      ["磁盘命中", (disk.hit_rate === null || disk.hit_rate === undefined)
-        ? "—"
-        : `${fmt(disk.hit_rate * 100, 1)} %（${fmtInt(disk.hits)}/${fmtInt(disk.queries)} 块）`],
-      ["磁盘文件", `${fmtInt(disk.files)} 个 · 生效上限 ${gib(diskLimit)}`
-        + (disk.limit_bytes ? "" : `（自动，保留 ${gib(disk.reserve_bytes)}）`)],
-      ["失败/丢弃", `升级失败 ${fmtInt(disk.promo_fail)} · 背压丢弃 ${fmtInt(disk.dropped_stores)}`],
-    ];
+    const info = diskOff
+      ? [["磁盘层", "已禁用 · 本次启动只有 GPU → CPU 两级（重新开启需重启引擎）"]]
+      : [
+          ["磁盘 IO", `读 ${mbps(disk.read_bps)} · 写 ${mbps(disk.write_bps)}`],
+          ["磁盘命中", (disk.hit_rate === null || disk.hit_rate === undefined)
+            ? "—"
+            : `${fmt(disk.hit_rate * 100, 1)} %（${fmtInt(disk.hits)}/${fmtInt(disk.queries)} 块）`],
+          ["磁盘文件", `${fmtInt(disk.files)} 个 · 生效上限 ${gib(diskLimit)}`
+            + (disk.limit_bytes ? "" : `（自动，保留 ${gib(disk.reserve_bytes)}）`)],
+          ["失败/丢弃", `升级失败 ${fmtInt(disk.promo_fail)} · 背压丢弃 ${fmtInt(disk.dropped_stores)}`],
+        ];
+    if (diskOff) {
+      info.push(["旧数据", `${gib(disk.used_bytes)} / ${fmtInt(disk.files)} 个文件（不再回收，可手动删）`]);
+    }
     if (disk.near_full) {
       info.unshift(["⚠️ 磁盘将满", `剩余 ${gib(disk.free_bytes)} < 保留区 `
         + `${gib(disk.reserve_bytes)}：offload 写入即将失败（ENOSPC）`]);
     }
     const health = kv.health || {};
-    info.push(["磁盘健康", health.error
-      ? `不可用：${health.error}`
-      : `已用 ${fmt(health.pct_used, 0)}% · ${fmt(health.temp_c, 1)}°C · 余量 ${fmt(health.spare_pct, 0)}%`
-        + ` · 媒体错误 ${fmtInt(health.media_errors)} · 累计写 ${fmt(health.written_gb, 0)} GiB`]);
-    if (kv.reclaim && kv.reclaim.last_at) {
+    if (!diskOff) {
+      info.push(["磁盘健康", health.error
+        ? `不可用：${health.error}`
+        : `已用 ${fmt(health.pct_used, 0)}% · ${fmt(health.temp_c, 1)}°C · 余量 ${fmt(health.spare_pct, 0)}%`
+          + ` · 媒体错误 ${fmtInt(health.media_errors)} · 累计写 ${fmt(health.written_gb, 0)} GiB`]);
+    }
+    if (!diskOff && kv.reclaim && kv.reclaim.last_at) {
       const rec = kv.reclaim;
       info.push(["上次回收", rec.error
         ? `失败：${rec.error}`

@@ -242,6 +242,10 @@ class Controller:
         effective = {
             "offload_enabled": "1" if bool(kv.enabled) else "0",
             "cpu_bytes_to_use": str(kv.cpu_bytes_to_use),
+            # Disk tier is a launch-time decision (the fs tier is either in the
+            # --kv-transfer-config or it is not), so it has to be a real option
+            # whose default comes from config.yaml.
+            "kv_disk_enabled": "1" if bool(getattr(kv, "disk_enabled", True)) else "0",
             # kv_disk_limit_gb has no UI option on purpose: it is monitor-side
             # reclaim policy, never part of the engine argv.
             "kvoffload_dir": str(self.cfg.p("kvcache.disk_dir")),
@@ -287,8 +291,14 @@ class Controller:
         """
         kv = self.cfg.root.kvcache
         enabled = bool(kv.enabled)
+        disk = enabled and bool(getattr(kv, "disk_enabled", True))
         out = {
             "offload_enabled": "1" if enabled else "0",
+            # Whether the layer carries a disk (fs) secondary tier at all. When
+            # off, the engine runs the CPU primary tier only: no second-level
+            # store, no ENOSPC, no reclaim, but prefix reuse is lost across
+            # engine restarts (RAM is the only place a prefix survives).
+            "kv_disk_enabled": "1" if disk else "0",
             "kv_disk_limit_gb": str(int(float(kv.disk_limit_gb or 0))),
         }
         if enabled:
