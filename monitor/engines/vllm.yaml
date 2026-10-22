@@ -23,6 +23,10 @@ size_vars: [cpu_bytes_to_use]
 models:
   # Same resolution order as run_llm.sh: first candidate containing <dir>/config.json
   dir_candidates:
+    # The model volume first: /mnt/models/hf is where checkpoints live on this
+    # box (vg_ssd1-lv_models). Whatever candidate matches becomes the container's
+    # /models, so adding a model = unpacking it under /mnt/models/hf.
+    - "/mnt/models/hf"
     - "${project_dir}/models"
     - "/home/eedy/workspace/git/vllm/models"
   dir_name: "Qwen3.8-27B-FP8"
@@ -32,8 +36,18 @@ defaults:
   # 48 of 64 layers are linear attention: each decode sequence pins one Mamba
   # cache block. At gpu_mem_util 0.92 only ~250 blocks exist, so vLLM's default
   # max_num_seqs=256 makes CUDA-graph capture fail. Keep this below the blocks.
-  max_num_seqs: "192"
-  max_num_batched_tokens: "2048"
+  # 2026-10-22: 192 was wildly out of line with the real budget (128k ctx =
+  # 81 blocks/request → ~186 blocks ≈ 2.3 concurrent); admitting 192 sequences
+  # just made the KV tier thrash. Measured on 6×56k concurrent (128k ctx):
+  #   seqs=4  -> 38 tok/s agg, TTFT 19-25 s
+  #   seqs=8  -> 62 tok/s agg, TTFT 5-13 s      ← best
+  #   seqs=16 -> 12 tok/s agg (thrash)
+  # Short-request traffic (8×2k) still gets 244 tok/s at 8.
+  max_num_seqs: "8"
+  # 2048 → 8192 (2026-10-22): at 2048 a handful of long prefills eat the whole
+  # per-step budget and decode collapses to ~6 tok/s (measured 6×56k concurrent).
+  # 8192 measured prefill +2~4 %, KV −1.5 %; 32768 startup-OOMs on this card.
+  max_num_batched_tokens: "8192"
   gpu_mem_util: "0.92"
   # fp8 halves the KV footprint; 256k fits (366,097 KV tokens = 1.40x).
   kv_cache_dtype: "fp8"
@@ -56,6 +70,9 @@ defaults:
   # Disk-tier budget in GiB (0 = use the whole filesystem). vLLM's fs tier has
   # no capacity limit of its own, so the monitor enforces this by reclaiming
   # the oldest block files (see monitor/kvcache.py).
+  # NOT a UI option on purpose: it is monitor-side policy, it never reaches the
+  # engine argv, and exposing it next to real vLLM flags read as if it did.
+  # Set config.yaml → kvcache.disk_limit_gb instead (controller.kvcache_vars()).
   kv_disk_limit_gb: "0"
   spec_tokens:
     stage1: null
@@ -211,6 +228,14 @@ layers:
 # Fields rendered by the web UI for THIS engine. `key` is the launcher variable
 # name, so adding a field never needs UI code.
 options:
+  # Which checkpoint to serve. The choices are filled at /api/engines time from
+  # the directories that actually exist under models/ (see
+  # launcher.model_dirs), so a half-downloaded dir never shows up.
+  - key: model_dir_name
+    label: "模型"
+    type: enum
+    choices: []
+    hint: "models/ 下的目录（必须含 config.json）；换模型后确认它有 MTP 层，否则 profile mtp 会启动失败"
   - key: kv_cache_dtype
     label: "KV 类型"
     type: enum
@@ -225,13 +250,13 @@ options:
   - key: max_num_seqs
     label: "max num seqs"
     type: int
-    default: 192
-    hint: "受 Mamba cache block 数限制（约 250）"
+    default: 8
+    hint: "并发序列上限。192 对 128k 上下文完全脱节；实测 6×56k 并发 seqs=8 最快（62 tok/s），16 会抖动"
   - key: max_num_batched_tokens
     label: "prefill chunk (tokens/step)"
     type: int
-    default: 2048
-    hint: "每步 token 预算 = chunk 大小。2048 是 vLLM 默认；8192 实测快 2~4%（KV −1.5%、磁盘 IO ×5）；32768 在本卡会 OOM"
+    default: 8192
+    hint: "每步 token 预算 = chunk 大小。2048 时长 prefill 会饿死 decode（6×56k 并发实测只剩 6 tok/s）；8192 实测 prefill 快 2~4%；32768 在本卡会 OOM"
   - key: gpu_mem_util
     label: "GPU 显存占比"
     type: float
@@ -284,12 +309,6 @@ options:
     placeholder: "/mnt/kvcache/kvoffload"
     show_if: {offload_enabled: [true, "1", "on"]}
     hint: "宿主机路径，容器内挂到 /kvoffload；默认来自 config.yaml → kvcache.disk_dir"
-  - key: kv_disk_limit_gb
-    label: "磁盘 cache 上限 (GiB)"
-    type: int
-    default: 0
-    show_if: {offload_enabled: [true, "1", "on"]}
-    hint: "0 = 用满 cache 目录所在分区；>0 时由 monitor 回收最旧的块文件"
   - key: api_key
     label: "API Key"
     type: password

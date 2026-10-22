@@ -138,6 +138,49 @@ def available_engines(engine_dir: Path | None = None) -> list[str]:
     return sorted(p.stem for p in (engine_dir or ENGINE_DIR).glob("*.yaml"))
 
 
+def model_dirs(engine: str, engine_dir: Path | None = None,
+               project_dir: Path | str | None = None) -> list[str]:
+    """Model directories this engine can actually load right now.
+
+    A directory counts when it holds a `config.json`, which is exactly the test
+    `resolve()` uses (`models.dir_candidates` + `dir_name`). The UI renders these
+    as the `model_dir_name` choices, so switching models is a dropdown instead of
+    editing engines/vllm.yaml — and a half-downloaded directory never shows up.
+    """
+    spec = load_spec(engine, engine_dir)
+    project = Path(project_dir) if project_dir else _default_project_dir()
+    variables = {
+        "project_dir": str(project),
+        "home": str(Path.home()),
+        "monitor_dir": str(Path(__file__).resolve().parent.parent),
+        "engine": engine,
+    }
+    names: list[str] = []
+    seen: set[str] = set()
+    for candidate in (spec.get("models") or {}).get("dir_candidates") or []:
+        try:
+            root = Path(str(_render(candidate, variables, "models.dir_candidates")))
+        except Exception:  # pragma: no cover - a broken spec must not break the UI
+            continue
+        if not root.is_dir():
+            continue
+        for child in sorted(root.iterdir()):
+            if not child.is_dir() or child.name in seen:
+                continue
+            if not (child / "config.json").exists():
+                continue
+            # A downloader's control file means the shards are still moving:
+            # listing it would let the UI launch a half-written checkpoint.
+            if any(child.glob("*.aria2")) or any(child.glob("*.part")):
+                continue
+            # A GGUF-only directory has a config.json but nothing vLLM can load.
+            if not any(child.glob("*.safetensors")):
+                continue
+            seen.add(child.name)
+            names.append(child.name)
+    return names
+
+
 @dataclass
 class LaunchPlan:
     engine: str

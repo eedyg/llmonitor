@@ -225,6 +225,59 @@ def test_kv_type_choices_reach_argv():
 def test_schema_keys_are_known_variables():
     for engine in ("vllm", "ninfer"):
         spec = launcher.load_spec(engine)
-        known = set((spec.get("defaults") or {}).keys()) | {"api_key"}
+        # `model_dir_name` is not a spec default: the launcher derives it from
+        # models.dir_name, and the UI turns it into a dropdown (launcher.model_dirs).
+        known = set((spec.get("defaults") or {}).keys()) | {"api_key", "model_dir_name"}
         for opt in spec.get("options") or []:
             assert opt["key"] in known, f"{engine}: unknown option key {opt['key']}"
+
+
+def test_model_dirs_lists_only_loadable_checkpoints(tmp_path):
+    models = tmp_path / "models"
+    for name, has_config in (("Qwen3.8-27B-FP8", True), ("Qwen3.8-27B-NVFP4", True),
+                             ("half-downloaded", False)):
+        (models / name).mkdir(parents=True)
+        if has_config:
+            (models / name / "config.json").write_text("{}", encoding="utf-8")
+            (models / name / "model-00001-of-00001.safetensors").write_text("", encoding="utf-8")
+    # still downloading (aria2 control file) -> not offered
+    (models / "in-flight").mkdir()
+    (models / "in-flight" / "config.json").write_text("{}", encoding="utf-8")
+    (models / "in-flight" / "model-00001.safetensors.aria2").write_text("", encoding="utf-8")
+    (models / "notes.txt").write_text("x", encoding="utf-8")
+    # GGUF-only: has config.json but nothing vLLM can load
+    (models / "gguf-only").mkdir()
+    (models / "gguf-only" / "config.json").write_text("{}", encoding="utf-8")
+    (models / "gguf-only" / "model-Q4_K_M.gguf").write_text("", encoding="utf-8")
+
+    names = launcher.model_dirs("vllm", project_dir=tmp_path)
+    assert "Qwen3.8-27B-FP8" in names and "Qwen3.8-27B-NVFP4" in names
+    assert "half-downloaded" not in names     # no config.json yet
+    assert "in-flight" not in names           # downloader control file present
+    assert "gguf-only" not in names           # no safetensors to load
+    assert "notes.txt" not in names
+
+
+def test_vllm_exposes_the_model_choice():
+    schema = launcher.engine_schema("vllm")
+    opt = next(o for o in schema["options"] if o["key"] == "model_dir_name")
+    assert opt["type"] == "enum" and opt["label"]
+
+
+def test_model_choices_are_filled_from_disk(monkeypatch):
+    from types import SimpleNamespace
+
+    from monitor.config import Config
+    from monitor.controller import Controller
+
+    monkeypatch.setattr(launcher, "model_dirs", lambda engine: ["Qwen3.8-27B-FP8", "A-NVFP4"])
+    stub = SimpleNamespace(cfg=Config("/nonexistent/monitor-test-config.yaml"))
+    schema = {"options": [{"key": "model_dir_name", "type": "enum"}]}
+
+    Controller.apply_model_choices(stub, schema, "vllm")
+    opt = schema["options"][0]
+    assert opt["choices"][:2] == ["Qwen3.8-27B-FP8", "A-NVFP4"]
+    # the spec's dir_name stays the default (and stays selectable even if the
+    # directory is missing, so the UI never shows an empty select)
+    assert opt["default"] == "Qwen3.8-27B-FP8"
+    assert "Qwen3.8-27B-FP8" in opt["choices"]

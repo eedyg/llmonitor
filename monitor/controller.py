@@ -242,13 +242,42 @@ class Controller:
         effective = {
             "offload_enabled": "1" if bool(kv.enabled) else "0",
             "cpu_bytes_to_use": str(kv.cpu_bytes_to_use),
-            "kv_disk_limit_gb": str(int(float(kv.disk_limit_gb or 0))),
+            # kv_disk_limit_gb has no UI option on purpose: it is monitor-side
+            # reclaim policy, never part of the engine argv.
             "kvoffload_dir": str(self.cfg.p("kvcache.disk_dir")),
         }
         for opt in schema.get("options") or []:
             key = opt.get("key")
             if key in effective:
                 opt["default"] = effective[key]
+
+    def apply_model_choices(self, schema: dict, engine: str | None = None) -> None:
+        """Fill the model dropdown with the checkpoints that are on disk.
+
+        The spec still decides the default (`models.dir_name`); this only makes
+        the alternatives selectable, so trying another checkpoint is a dropdown
+        change instead of an YAML edit.
+        """
+        name = (engine or schema.get("engine") or self.cfg.root.engine.default or "vllm").lower()
+        try:
+            dirs = launcher.model_dirs(name)
+        except Exception:  # pragma: no cover - a broken spec must not break the UI
+            dirs = []
+        current = ""
+        try:
+            current = str(((launcher.load_spec(name).get("models") or {}).get("dir_name")) or "")
+        except Exception:  # pragma: no cover
+            pass
+        for opt in schema.get("options") or []:
+            if opt.get("key") != "model_dir_name":
+                continue
+            if dirs:
+                choices = list(dirs)
+                if current and current not in choices:
+                    choices.append(current)
+                opt["choices"] = choices
+            if current and not opt.get("default"):
+                opt["default"] = current
 
     def kvcache_vars(self) -> dict[str, str]:
         """Engine variables for the KV offload layer (config.yaml → kvcache).
